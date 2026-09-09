@@ -9,6 +9,7 @@
         private readonly Steam3Session _steam3Session;
         private readonly LicenseManager _licenseManager;
         private readonly Func<List<uint>, Task<PICSTokensCallback>> _requestAccessTokensAsync;
+        private readonly Func<List<PICSRequest>, Task<AsyncJobMultiple<PICSProductInfoCallback>.ResultSet>> _requestProductsAsync;
 
         private static readonly TimeSpan MetadataRequestTimeout = TimeSpan.FromSeconds(45);
 
@@ -31,12 +32,14 @@
             IAnsiConsole ansiConsole,
             Steam3Session steam3Session,
             LicenseManager licenseManager,
-            Func<List<uint>, Task<PICSTokensCallback>> requestAccessTokensAsync)
+            Func<List<uint>, Task<PICSTokensCallback>> requestAccessTokensAsync,
+            Func<List<PICSRequest>, Task<AsyncJobMultiple<PICSProductInfoCallback>.ResultSet>> requestProductsAsync = null)
         {
             _ansiConsole = ansiConsole;
             _steam3Session = steam3Session;
             _licenseManager = licenseManager;
             _requestAccessTokensAsync = requestAccessTokensAsync;
+            _requestProductsAsync = requestProductsAsync ?? (requests => steam3Session.SteamAppsApi.PICSGetProductInfo(requests, new List<PICSRequest>()).ToTask());
         }
 
         /// <summary>
@@ -136,11 +139,13 @@
             // same way the manifest request code is.  One catch covers both because nothing between them
             // waits on Steam, and the framework's own timeout text does not say what failed. [30]
             AsyncJobMultiple<PICSProductInfoCallback>.ResultSet resultSet;
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _steam3Session.AuthLostToken);
+            var stage = "access-tokens";
             try
             {
                 // Some apps will require an additional "access token" in order to retrieve their app metadata
                 var accessTokensResponse = await _requestAccessTokensAsync(appIdsToLoad)
-                    .WaitAsync(MetadataRequestTimeout, cancellationToken);
+                    .WaitAsync(MetadataRequestTimeout, linked.Token);
                 var appTokens = accessTokensResponse.AppTokens;
 
                 // Build out the requests
@@ -157,23 +162,36 @@
                 }
 
                 // Finally request the metadata from steam
-                resultSet = await _steam3Session.SteamAppsApi
-                    .PICSGetProductInfo(requests, new List<PICSRequest>())
-                    .ToTask()
-                    .WaitAsync(MetadataRequestTimeout, cancellationToken);
+                stage = "product-details";
+                resultSet = await _requestProductsAsync(requests)
+                    .WaitAsync(MetadataRequestTimeout, linked.Token);
             }
-            catch (TimeoutException e)
+            catch (Exception e) when (e is AsyncJobFailedException or TimeoutException ||
+                                      e is OperationCanceledException && !cancellationToken.IsCancellationRequested)
             {
-                throw new SteamConnectionException(
-                    $"Steam did not answer a request for game details within {MetadataRequestTimeout.TotalSeconds:0} seconds. " +
-                    "The Steam connection may be down; try again, and log in to Steam again if it keeps failing.", e);
+                cancellationToken.ThrowIfCancellationRequested();
+                var failure = new SteamConnectionException(_steam3Session.IsAuthenticated
+                    ? SteamFailure.GameDetailsUnavailable : SteamFailure.AuthLost, e)
+                {
+                    Stage = stage,
+                    AppIds = appIdsToLoad.ToArray(),
+                    LoginId = _steam3Session.LoginId,
+                    SteamResult = _steam3Session.LogoffResult
+                };
+                FileLogger.LogException(failure.GetContext(), failure);
+                throw failure;
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!_steam3Session.IsAuthenticated) throw new SteamConnectionException(SteamFailure.AuthLost);
 
             List<PicsProductInfo> appInfos = resultSet.Results.SelectMany(e => e.Apps).Select(e => e.Value).ToList();
             foreach (var app in appInfos)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                LoadedAppInfos.TryAdd(app.ID, new AppInfo(_steam3Session, app.ID, app.KeyValues));
+                _steam3Session.WhileAuthenticated(
+                    () => LoadedAppInfos.TryAdd(app.ID, new AppInfo(_steam3Session, app.ID, app.KeyValues)),
+                    cancellationToken);
 
                 app.KeyValues.WriteSteamMetadataToDisk($@"{AppConfig.DebugOutputDir}\AppInfo\AppInfo_{app.ID}.txt");
             }

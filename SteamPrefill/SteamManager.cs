@@ -1,5 +1,7 @@
 ﻿namespace SteamPrefill
 {
+#nullable enable annotations
+
     public sealed class SteamManager : IDisposable
     {
         private readonly IAnsiConsole _ansiConsole;
@@ -18,10 +20,20 @@
         // start. A one-game run could report "4 updated, 13 failed" and the failure count climbed by
         // one on every run forever, which made a caller unable to tell what THIS run did.
         private PrefillSummaryResult _prefillSummaryResult = new PrefillSummaryResult();
-        private readonly IPrefillProgress _progress;
+        private readonly CallbackProgress _progress;
+        private readonly AsyncLocal<IPrefillProgress> _runProgress = new();
 
-        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null)
-            : this(ansiConsole, downloadArgs, new Steam3Session(ansiConsole, authProvider), progress)
+        public bool IsAuthenticated => _steam3.IsAuthenticated;
+        internal string Username => _steam3.Username;
+        internal DateTime? AuthExpiryUtc => _steam3.AuthExpiryUtc;
+        public event Action<EResult?> AuthenticationLost
+        {
+            add => _steam3.AuthenticationLost += value;
+            remove => _steam3.AuthenticationLost -= value;
+        }
+
+        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null, Action<Action>? commitCredentials = null)
+            : this(ansiConsole, downloadArgs, new Steam3Session(ansiConsole, authProvider, commitCredentials), progress)
         {
         }
 
@@ -40,7 +52,17 @@
         {
             _ansiConsole = ansiConsole;
             _downloadArgs = downloadArgs;
-            _progress = progress ?? NullProgress.Instance;
+            var output = progress ?? NullProgress.Instance;
+            var callbacks = new CallbackProgress();
+            callbacks.LogReceived += (level, message) => (_runProgress.Value ?? output).OnLog(level, message);
+            callbacks.OperationStarted += name => (_runProgress.Value ?? output).OnOperationStarted(name);
+            callbacks.OperationCompleted += (name, elapsed) => (_runProgress.Value ?? output).OnOperationCompleted(name, elapsed);
+            callbacks.AppStarted += app => (_runProgress.Value ?? output).OnAppStarted(app);
+            callbacks.DownloadProgressUpdated += value => (_runProgress.Value ?? output).OnDownloadProgress(value);
+            callbacks.AppCompleted += (app, result) => (_runProgress.Value ?? output).OnAppCompleted(app, result);
+            callbacks.PrefillCompleted += summary => (_runProgress.Value ?? output).OnPrefillCompleted(summary);
+            callbacks.ErrorOccurred += (message, error) => (_runProgress.Value ?? output).OnError(message, error);
+            _progress = callbacks;
 
             _steam3 = steam3;
             _cdnPool = cdnPool ?? new CdnPool(_ansiConsole, _steam3);
@@ -62,7 +84,7 @@
             _ansiConsole.LogMarkupLine("Starting login!");
 
             await _steam3.LoginToSteamAsync(cancellationToken);
-            _steam3.WaitForLicenseCallback();
+            await _steam3.WaitForLicenseCallback(cancellationToken);
 
             _ansiConsole.LogMarkupLine("Steam session initialization complete!", timer);
             // White spacing + a horizontal rule to delineate that initialization has completed
@@ -109,15 +131,17 @@
         /// <param name="prefillRecentGames">If set to true, games played in the last 2 weeks will be downloaded</param>
         /// <param name="prefillPopularGames">If set to a value > 0, the most popular N games will be downloaded</param>
         /// <param name="prefillRecentlyPurchasedGames">If set to true, games purchased in the last 2 weeks will be downloaded</param>
+        [SuppressMessage("Design", "CA1068", Justification = "Preserves existing positional cancellation callers.")]
         public async Task DownloadMultipleAppsAsync(bool downloadAllOwnedGames, bool prefillRecentGames,
                                                     int? prefillPopularGames, bool prefillRecentlyPurchasedGames,
-                                                    CancellationToken cancellationToken = default)
+                                                    CancellationToken cancellationToken = default, IPrefillProgress? progress = null)
         {
+            _runProgress.Value = progress;
             // Every Steam call below waits on a session that is already gone, so the run would otherwise
             // sit silent until the caller's stall timeout instead of reporting why nothing downloaded.
-            if (_steam3.IsDisconnected)
+            if (!_steam3.IsAuthenticated)
             {
-                throw new SteamConnectionException("Steam connection was lost. Log in to Steam again, then start the prefill.");
+                throw new SteamConnectionException(SteamFailure.AuthLost);
             }
 
             // This run's counters and its own elapsed clock. Without this the summary carries every
@@ -168,7 +192,7 @@
 
             // AppIds can potentially be added twice when building out the full list of ids
             var distinctAppIds = appIdsToDownload.Distinct().ToList();
-            
+
             // Report progress for metadata retrieval (can be slow for large libraries)
             _progress.OnLog(LogLevel.Info, $"Loading metadata for {distinctAppIds.Count} apps...");
             await _appInfoHandler.RetrieveAppMetadataAsync(
@@ -183,7 +207,7 @@
                 distinctAppIds,
                 cancellationToken);
             _progress.OnLog(LogLevel.Info, $"Starting prefill of {availableGames.Count} games");
-            
+
             await DownloadAppsAsync(
                 availableGames,
                 DownloadSingleAppAsync,
@@ -238,6 +262,10 @@
                 try
                 {
                     await downloadAppAsync(app, cancellationToken);
+                }
+                catch (SteamConnectionException)
+                {
+                    throw;
                 }
                 catch (Exception e) when (e is LancacheNotFoundException || e is InfiniteLoopException)
                 {
@@ -475,7 +503,7 @@
 
             var appStatuses = new ConcurrentBag<AppStatus>();
             var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
-            
+
             _ansiConsole.LogMarkupVerbose($"Getting status for {Magenta(availableGames.Count)} available games out of {Magenta(appIds.Count)} requested");
 
             // Build OS names string for error messages
@@ -564,9 +592,9 @@
                     if (cachedByApp != null && cachedByApp.TryGetValue(app.AppId, out var cachedManifests))
                     {
                         // Use passed-in cached manifests for comparison
-                        isUpToDate = _downloadArgs.Force == false && 
-                            filteredDepots.All(d => 
-                                cachedManifests.TryGetValue(d.DepotId, out var cachedManifest) && 
+                        isUpToDate = _downloadArgs.Force == false &&
+                            filteredDepots.All(d =>
+                                cachedManifests.TryGetValue(d.DepotId, out var cachedManifest) &&
                                 cachedManifest == d.ManifestId.Value);
                     }
                     else
@@ -592,6 +620,10 @@
                     });
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (SteamConnectionException ex) when (ex.Failure != null)
                 {
                     throw;
                 }
@@ -752,6 +784,10 @@
                     });
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (SteamConnectionException ex) when (ex.Failure != null)
                 {
                     throw;
                 }

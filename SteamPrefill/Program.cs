@@ -1,5 +1,7 @@
 using SteamPrefill.Api;
 
+#nullable enable annotations
+
 namespace SteamPrefill
 {
     public static class Program

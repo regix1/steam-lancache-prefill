@@ -23,6 +23,327 @@ namespace SteamPrefill.Test;
 [Collection("SteamAccountFile")]
 public sealed class DaemonReliabilityTests
 {
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task PicsFailure_UsesLiveAuthenticationAndPreservesCause(bool productStage, bool lost)
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, !lost);
+        var cause = new AsyncJobFailedException();
+        var tokens = (SteamApps.PICSTokensCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamApps.PICSTokensCallback));
+        typeof(SteamApps.PICSTokensCallback).GetProperty(nameof(SteamApps.PICSTokensCallback.AppTokens))!.SetValue(tokens, new Dictionary<uint, ulong>());
+        var handler = new AppInfoHandler(new TestConsole(), session, session.LicenseManager,
+            _ => productStage ? Task.FromResult(tokens) : Task.FromException<SteamApps.PICSTokensCallback>(cause),
+            _ => Task.FromException<AsyncJobMultiple<SteamApps.PICSProductInfoCallback>.ResultSet>(cause));
+
+        var error = await Assert.ThrowsAsync<SteamConnectionException>(() => handler.GetAppInfoAsync(222));
+        Assert.Same(cause, error.InnerException);
+        Assert.Equal(lost ? SteamFailure.AuthLost : SteamFailure.GameDetailsUnavailable, error.Failure);
+        Assert.Empty(handler.LoadedAppInfos);
+        Assert.DoesNotContain(nameof(AsyncJobFailedException), error.Message, StringComparison.Ordinal);
+        using var context = JsonDocument.Parse(error.GetContext("get-owned-games", "request-1"));
+        Assert.Equal(productStage ? "product-details" : "access-tokens", context.RootElement.GetProperty("picsStage").GetString());
+        Assert.Equal("request-1", context.RootElement.GetProperty("operationId").GetString());
+        Assert.Equal(222u, context.RootElement.GetProperty("appIds")[0].GetUInt32());
+        Assert.Equal(!lost, session.IsAuthenticated);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task IdleSteamLoss_IsConsumedByPumpAndInvalidatesApi(bool disconnect)
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
+        var lost = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var losses = 0;
+        session.AuthenticationLost += _ => { Interlocked.Increment(ref losses); lost.TrySetResult(); };
+        var client = (SteamClient)typeof(Steam3Session).GetField("_steamClient", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        CallbackMsg callback = disconnect
+            ? (SteamClient.DisconnectedCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamClient.DisconnectedCallback))
+            : (SteamUser.LoggedOffCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamUser.LoggedOffCallback));
+        typeof(CallbackMsg).GetProperty(nameof(CallbackMsg.JobID))!.SetValue(callback, new JobID(0));
+        client.PostCallback(callback);
+        await lost.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(session.IsAuthenticated);
+        client.PostCallback(callback);
+        session.Disconnect();
+        Assert.Equal(1, losses);
+        var pump = (Task)typeof(Steam3Session).GetField("_pump", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        Assert.True(pump.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task SessionLoss_UnblocksLicenseWait()
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
+        var waiting = session.WaitForLicenseCallback();
+        session.Disconnect();
+        var error = await Assert.ThrowsAsync<SteamConnectionException>(() => waiting.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(SteamFailure.AuthLost, error.Failure);
+    }
+
+    [Fact]
+    public async Task LoggedOffBeforeInitializationContinuation_CannotRestoreReadiness()
+    {
+        using var session = new Steam3Session(new TestConsole());
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        typeof(SteamPrefillApi).GetField("_steamManager", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api,
+            new SteamManager(new TestConsole(), new DownloadArguments(), session));
+        var client = (SteamClient)typeof(Steam3Session).GetField("_steamClient", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        var loggedOn = (SteamUser.LoggedOnCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamUser.LoggedOnCallback));
+        typeof(CallbackMsg).GetProperty(nameof(CallbackMsg.JobID))!.SetValue(loggedOn, new JobID(0));
+        typeof(SteamUser.LoggedOnCallback).GetProperty(nameof(SteamUser.LoggedOnCallback.Result))!.SetValue(loggedOn, EResult.OK);
+        var loggedOff = (SteamUser.LoggedOffCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamUser.LoggedOffCallback));
+        typeof(CallbackMsg).GetProperty(nameof(CallbackMsg.JobID))!.SetValue(loggedOff, new JobID(0));
+        var lost = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.AuthenticationLost += _ => lost.TrySetResult();
+        client.PostCallback(loggedOn);
+        client.PostCallback(loggedOff);
+        await lost.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        typeof(SteamPrefillApi).GetField("_isInitialized", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, true);
+        Assert.False(api.IsInitialized);
+        Assert.False(session.IsAuthenticated);
+    }
+
+    [Fact]
+    public async Task CallbackShutdown_DoesNotWaitOnItsOwnPump()
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.AuthenticationLost += _ => { session.Disconnect(); stopped.TrySetResult(); };
+        var callback = (SteamUser.LoggedOffCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamUser.LoggedOffCallback));
+        typeof(CallbackMsg).GetProperty(nameof(CallbackMsg.JobID))!.SetValue(callback, new JobID(0));
+        var client = (SteamClient)typeof(Steam3Session).GetField("_steamClient", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        client.PostCallback(callback);
+        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(session.IsAuthenticated);
+    }
+
+    [Fact]
+    public async Task TerminalPublication_KeepsSuccessorAdmissionClosed()
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        typeof(SteamPrefillApi).GetField("_steamManager", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api,
+            new SteamManager(new TestConsole(), new DownloadArguments(), session));
+        typeof(SteamPrefillApi).GetField("_isInitialized", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, true);
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        typeof(SocketCommandInterface).GetField("_api", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(commands, api);
+        using var release = new ManualResetEventSlim();
+        var publishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var progress = new SocketCommandInterface.SocketProgress(_ => { publishing.TrySetResult(); release.Wait(); }, operationId: "publishing-run");
+        var slot = typeof(SocketCommandInterface).GetField("_run", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        slot.SetValue(commands, progress);
+        var completion = (Task)typeof(SocketCommandInterface).GetMethod("CompletePrefillAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(commands, new object[] { progress, Task.FromResult(new OwnedOperationResult(OwnedOperationStatus.Completed)) })!;
+        try
+        {
+            await publishing.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            var response = await (Task<CommandResponse>)typeof(SocketCommandInterface).GetMethod("HandlePrefillAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(commands, new object[] { new CommandRequest { Id = "next-run", Type = "prefill" }, CancellationToken.None })!;
+            Assert.False(response.Success);
+            Assert.Same(progress, slot.GetValue(commands));
+            Assert.False(progress.Publication.Task.IsCompleted);
+        }
+        finally { release.Set(); await completion; }
+        Assert.Null(slot.GetValue(commands));
+        Assert.True(progress.Publication.Task.IsCompletedSuccessfully);
+    }
+
+    [Theory]
+    [InlineData(OwnedOperationStatus.Completed)]
+    [InlineData(OwnedOperationStatus.Cancelled)]
+    [InlineData(OwnedOperationStatus.Failed)]
+    public async Task TerminalSelection_IsStableAndProgressPrecedesTerminal(OwnedOperationStatus first)
+    {
+        var updates = new List<PrefillProgressUpdate>();
+        var progress = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "run-1");
+        progress.OnAppStarted(new AppDownloadInfo { AppId = 222, Name = "Game" });
+        var failure = new SteamConnectionException(SteamFailure.AuthLost, new AsyncJobFailedException());
+        progress.SelectTerminal(first, first == OwnedOperationStatus.Failed ? failure : null);
+        progress.SelectTerminal(OwnedOperationStatus.Failed, failure);
+        progress.OnAppStarted(new AppDownloadInfo { AppId = 333, Name = "Late" });
+        progress.OnPrefillCompleted(new PrefillSummary { TotalApps = 999 });
+        await progress.PublishTerminalAsync(new OwnedOperationResult(OwnedOperationStatus.Completed));
+        await progress.PublishTerminalAsync(new OwnedOperationResult(OwnedOperationStatus.Failed));
+        Assert.Equal(2, updates.Count);
+        Assert.Equal("downloading", updates[0].State);
+        Assert.Equal(first == OwnedOperationStatus.Completed ? "completed" : first == OwnedOperationStatus.Cancelled ? "cancelled" : "error", updates[1].State);
+        Assert.Equal(0, updates[1].TotalApps);
+        Assert.All(updates, update => Assert.Equal("run-1", update.OperationId));
+        if (first == OwnedOperationStatus.Failed)
+        {
+            Assert.True(updates[1].RequiresLogin);
+            Assert.Equal("auth-lost", updates[1].ErrorCode);
+        }
+    }
+
+    [Fact]
+    public async Task FailedResult_ProducesFailedOwnerAndPreservesOriginalException()
+    {
+        await using var owner = new OwnedOperationCoordinator();
+        var updates = new List<PrefillProgressUpdate>();
+        var progress = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "run-failed");
+        var error = new SteamConnectionException(SteamFailure.GameDetailsUnavailable, new AsyncJobFailedException());
+        await owner.StartAsync(token => SocketCommandInterface.RunPrefillOperationAsync(
+            (_, _) => Task.FromResult(new PrefillResult { Success = false, Exception = error }),
+            new PrefillOptions(), progress, token));
+        var result = await owner.WaitAsync();
+        Assert.Equal(OwnedOperationStatus.Failed, result.Status);
+        Assert.Same(error, result.Exception);
+        Assert.Empty(updates);
+        await progress.PublishTerminalAsync(result);
+        Assert.Single(updates);
+        Assert.Equal("game-details-unavailable", updates[0].ErrorCode);
+        Assert.False(updates[0].RequiresLogin);
+    }
+
+    [Fact]
+    public void WireFields_AreOptionalAndNeverExposeException()
+    {
+        var result = new PrefillResult
+        {
+            Success = false,
+            ErrorCode = "auth-lost",
+            RequiresLogin = true,
+            Exception = new SteamConnectionException(SteamFailure.AuthLost, new AsyncJobFailedException())
+        };
+        var json = JsonSerializer.Serialize(result, DaemonSerializationContext.Default.PrefillResult);
+        Assert.DoesNotContain("exception", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("SteamKit", json, StringComparison.Ordinal);
+        var old = JsonSerializer.Deserialize("{\"success\":true}", DaemonSerializationContext.Default.PrefillResult)!;
+        Assert.Null(old.ErrorCode);
+        Assert.Null(old.RequiresLogin);
+        var progress = JsonSerializer.Deserialize("{\"state\":\"completed\"}", DaemonSerializationContext.Default.PrefillProgressUpdate)!;
+        Assert.Null(progress.OperationId);
+        Assert.Null(progress.ErrorCode);
+        Assert.Null(progress.RequiresLogin);
+    }
+
+    [Fact]
+    public async Task UnknownCommand_ReturnsCorrelatedSafeFailure()
+    {
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        var method = typeof(SocketCommandInterface).GetMethod("HandleCommandAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var response = await (Task<CommandResponse>)method.Invoke(commands, new object[]
+            { new CommandRequest { Id = "unknown-1", Type = "not-a-command" }, CancellationToken.None })!;
+        Assert.False(response.Success);
+        Assert.Equal("unknown-1", response.Id);
+        Assert.DoesNotContain("not-a-command", response.Error!, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("get-owned-games", false)]
+    [InlineData("get-owned-games", true)]
+    [InlineData("get-selected-apps-status", false)]
+    [InlineData("get-selected-apps-status", true)]
+    [InlineData("check-cache-status", false)]
+    [InlineData("check-cache-status", true)]
+    public async Task QueryFailure_ReturnsSafeFailureWithoutPrefillTerminal(string command, bool productStage)
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        var cause = new AsyncJobFailedException();
+        var tokens = (SteamApps.PICSTokensCallback)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SteamApps.PICSTokensCallback));
+        typeof(SteamApps.PICSTokensCallback).GetProperty(nameof(SteamApps.PICSTokensCallback.AppTokens))!.SetValue(tokens, new Dictionary<uint, ulong>());
+        var handler = new AppInfoHandler(new TestConsole(), session, session.LicenseManager,
+            _ => productStage ? Task.FromResult(tokens) : Task.FromException<SteamApps.PICSTokensCallback>(cause),
+            _ => Task.FromException<AsyncJobMultiple<SteamApps.PICSProductInfoCallback>.ResultSet>(cause));
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        var manager = new SteamManager(new TestConsole(), new DownloadArguments(), session, appInfoHandler: handler);
+        typeof(SteamPrefillApi).GetField("_steamManager", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, manager);
+        typeof(SteamPrefillApi).GetField("_isInitialized", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, true);
+        typeof(SteamPrefillApi).GetField("_selectedAppsCache", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, new List<uint> { 222 });
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        typeof(SocketCommandInterface).GetField("_api", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(commands, api);
+        var updates = new List<PrefillProgressUpdate>();
+        var active = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "other-run");
+        var slot = typeof(SocketCommandInterface).GetField("_run", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        slot.SetValue(commands, active);
+        try
+        {
+            var method = typeof(SocketCommandInterface).GetMethod("HandleCommandAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var response = await (Task<CommandResponse>)method.Invoke(commands, new object[]
+            {
+                new CommandRequest { Id = "query-1", Type = command, Parameters = new Dictionary<string, string>
+                    { ["cachedDepots"] = "[{\"appId\":222,\"depotId\":223,\"manifestId\":\"1\"}]" } },
+                CancellationToken.None
+            })!;
+            Assert.False(response.Success);
+            Assert.Null(response.Data);
+            Assert.Equal("query-1", response.Id);
+            Assert.Equal("game-details-unavailable", response.ErrorCode);
+            Assert.False(response.RequiresLogin);
+            Assert.Equal("Steam did not return game details. Try again.", response.Error);
+            Assert.Null(active.Terminal);
+            Assert.Empty(updates);
+        }
+        finally { slot.SetValue(commands, null); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PendingPicsRequest_StopsOnLossOrUserCancellation(bool cancel)
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
+        var response = new TaskCompletionSource<SteamApps.PICSTokensCallback>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new AppInfoHandler(new TestConsole(), session, session.LicenseManager,
+            _ => { started.TrySetResult(); return response.Task; });
+        using var cancellation = new CancellationTokenSource();
+        var query = handler.GetAppInfoAsync(222, cancellation.Token);
+        await started.Task;
+        if (cancel) cancellation.Cancel();
+        else session.Disconnect();
+        if (cancel) await Assert.ThrowsAnyAsync<OperationCanceledException>(() => query.WaitAsync(TimeSpan.FromSeconds(2)));
+        else Assert.Equal(SteamFailure.AuthLost, (await Assert.ThrowsAsync<SteamConnectionException>(() => query.WaitAsync(TimeSpan.FromSeconds(2)))).Failure);
+        response.TrySetResult(null!);
+        Assert.Empty(handler.LoadedAppInfos);
+    }
+
+    [Fact]
+    public async Task AuthLossDuringPrefill_WaitsForCleanupAndPublishesFailureOnce()
+    {
+        await using var owner = new OwnedOperationCoordinator();
+        var updates = new List<PrefillProgressUpdate>();
+        var progress = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "lost-run");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await owner.StartAsync(token => SocketCommandInterface.RunPrefillOperationAsync(async (_, token) =>
+        {
+            started.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            finally { cleanup.TrySetResult(); await release.Task; }
+            return new PrefillResult { Success = true };
+        }, new PrefillOptions(), progress, token));
+        await started.Task;
+        var error = new SteamConnectionException(SteamFailure.AuthLost);
+        progress.SelectTerminal(OwnedOperationStatus.Failed, error);
+        var completion = owner.CancelAndWaitAsync();
+        await cleanup.Task;
+        Assert.False(completion.IsCompleted);
+        Assert.Empty(updates);
+        release.TrySetResult();
+        var result = await completion;
+        Assert.Equal(OwnedOperationStatus.Failed, result.Status);
+        Assert.Same(error, result.Exception);
+        await progress.PublishTerminalAsync(result);
+        Assert.Single(updates);
+        Assert.Equal("error", updates[0].State);
+        Assert.True(updates[0].RequiresLogin);
+    }
+
     [Fact]
     public async Task ControlCommand_RespondsWhileSerializedCommandIsRunning()
     {
@@ -154,9 +475,12 @@ public sealed class DaemonReliabilityTests
         allowCleanup.TrySetResult();
         var result = await cancelTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal(OwnedOperationStatus.Cancelled, result.Status);
+        Assert.Empty(updates);
+        await progress.PublishTerminalAsync(result);
         Assert.Single(updates, update => update.State == "cancelled");
         Assert.DoesNotContain(updates, update => update.State is "completed" or "error");
 
+        progress = new SocketCommandInterface.SocketProgress(updates.Add);
         await coordinator.StartAsync(
             cancellationToken => SocketCommandInterface.RunPrefillOperationAsync(
                 (_, _) => Task.FromResult(new PrefillResult { Success = true }),
@@ -298,7 +622,8 @@ public sealed class DaemonReliabilityTests
     {
         var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var response = new TaskCompletionSource<SteamApps.PICSTokensCallback>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var steam3 = new Steam3Session(null);
+        using var steam3 = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(steam3, true);
         var appInfoHandler = new AppInfoHandler(
             new TestConsole(),
             steam3,
@@ -313,8 +638,7 @@ public sealed class DaemonReliabilityTests
         await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
         var exception = await Assert.ThrowsAsync<SteamConnectionException>(() => requestTask);
-        Assert.Contains("Steam did not answer", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("45 seconds", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(SteamFailure.GameDetailsUnavailable, exception.Failure);
         Assert.IsType<TimeoutException>(exception.InnerException);
         response.TrySetCanceled();
     }
@@ -711,7 +1035,8 @@ public sealed class DaemonReliabilityTests
     public async Task AppStatus_WhenEveryManifestFails_IsNotReportedUpToDate()
     {
         var console = new TestConsole();
-        var steam3 = new Steam3Session(null);
+        using var steam3 = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(steam3, true);
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
         steam3.LicenseManager._userLicenses.OwnedDepotIds.Add(123);
 
@@ -773,7 +1098,8 @@ public sealed class DaemonReliabilityTests
     public async Task AppStatus_WhenOneManifestFails_IsNotReportedUpToDate()
     {
         var console = new TestConsole();
-        var steam3 = new Steam3Session(null);
+        using var steam3 = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(steam3, true);
         var cachedDepot = CreateCachedDepot();
         var brokenDepot = CreateUncachedDepot();
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
@@ -847,7 +1173,8 @@ public sealed class DaemonReliabilityTests
         // caller could not tell what THIS run did. The reason was invisible too, because the per-app
         // handler wrote it only to the console and the log file, never to the progress channel.
         var console = new TestConsole();
-        var steam3 = new Steam3Session(null);
+        using var steam3 = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(steam3, true);
         var brokenDepot = CreateUncachedDepot();
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(brokenDepot.LicenseAppId);
@@ -915,7 +1242,8 @@ public sealed class DaemonReliabilityTests
     public async Task PrefillWhenEveryManifestFails_CountsTheAppAsFailed()
     {
         var console = new TestConsole();
-        var steam3 = new Steam3Session(null);
+        using var steam3 = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(steam3, true);
         var brokenDepot = CreateUncachedDepot();
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(brokenDepot.LicenseAppId);
@@ -984,7 +1312,8 @@ public sealed class DaemonReliabilityTests
     public async Task PrefillWhenOneManifestFails_CountsTheAppAsFailed()
     {
         var console = new TestConsole();
-        var steam3 = new Steam3Session(null);
+        using var steam3 = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(steam3, true);
         var cachedDepot = CreateCachedDepot();
         var brokenDepot = CreateUncachedDepot();
         steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);

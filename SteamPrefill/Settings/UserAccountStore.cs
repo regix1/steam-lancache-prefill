@@ -2,6 +2,8 @@
 using System.Security.Cryptography;
 using SteamPrefill.Api;
 
+#nullable enable annotations
+
 namespace SteamPrefill.Settings
 {
     /// <summary>
@@ -31,6 +33,9 @@ namespace SteamPrefill.Settings
         /// </summary>
         [ProtoIgnore]
         public ISteamAuthProvider? AuthProvider { get; set; }
+
+        [ProtoIgnore]
+        public Action<Action>? CommitCredentials { get; set; }
 
         [SuppressMessage("Security", "CA5394:Random is an insecure RNG", Justification = "Security doesn't matter here, as all that is needed is a unique id.")]
         private UserAccountStore()
@@ -145,11 +150,20 @@ namespace SteamPrefill.Settings
         #region Serialization
 
         [SuppressMessage("Security", "CA5394:Random is an insecure RNG", Justification = "Security doesn't matter here, as all that is needed is a unique id.")]
-        public static UserAccountStore LoadFromFile()
+        public static UserAccountStore LoadFromFile(Action<Action>? commitCredentials = null)
+        {
+            if (commitCredentials == null) return ReadAccount(null);
+            UserAccountStore account = null;
+            commitCredentials(() => account = ReadAccount(commitCredentials));
+            return account;
+        }
+
+        [SuppressMessage("Security", "CA5394", Justification = "Session identifiers need uniqueness, not secrecy.")]
+        private static UserAccountStore ReadAccount(Action<Action>? commitCredentials)
         {
             if (!File.Exists(AppConfig.AccountSettingsStorePath))
             {
-                return new UserAccountStore();
+                return new UserAccountStore { CommitCredentials = commitCredentials };
             }
 
             // Read file content to determine if it's encrypted or legacy plaintext protobuf
@@ -174,14 +188,14 @@ namespace SteamPrefill.Settings
                     AnsiConsole.MarkupLine("Stored credentials could not be decrypted, discarded stale token store, please log in again");
                     try
                     {
-                        File.Delete(AppConfig.AccountSettingsStorePath);
+                        if (commitCredentials == null) File.Delete(AppConfig.AccountSettingsStorePath);
                     }
                     catch (Exception ex)
                     {
                         // Deletion is best-effort; a fresh Save() overwrites it anyway.
                         AnsiConsole.MarkupLine($"Warning - failed to delete stale token store : {ex.Message}");
                     }
-                    return new UserAccountStore();
+                    return new UserAccountStore { CommitCredentials = commitCredentials };
                 }
                 var protobufBytes = System.Convert.FromBase64String(decryptedBase64);
                 using var memStream = new MemoryStream(protobufBytes);
@@ -205,6 +219,7 @@ namespace SteamPrefill.Settings
                 needsMigration = true;
             }
 
+            userAccountStore.CommitCredentials = commitCredentials;
             if (needsMigration)
             {
                 AnsiConsole.MarkupLine("Migrating account credentials to encrypted storage...");
@@ -215,6 +230,16 @@ namespace SteamPrefill.Settings
         }
 
         public void Save()
+        {
+            if (CommitCredentials != null)
+            {
+                CommitCredentials(SaveAccount);
+                return;
+            }
+            SaveAccount();
+        }
+
+        private void SaveAccount()
         {
             // Protobuf serialize -> byte[] -> Base64 string -> encrypt -> write to file
             using var memStream = new MemoryStream();

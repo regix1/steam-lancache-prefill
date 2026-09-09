@@ -57,6 +57,28 @@ namespace SteamPrefill.Test
         }
 
         [Fact]
+        public void CredentialCommit_RejectsSupersededAttempt()
+        {
+            using var commands = new SocketCommandInterface(Path.Combine(Path.GetTempPath(), $"steam-credentials-{Guid.NewGuid():N}.sock"));
+            var gate = typeof(SocketCommandInterface).GetField("_lifecycle", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(commands)!;
+            Action<Action> commit;
+            var saves = 0;
+            lock (gate)
+            {
+                typeof(SocketCommandInterface).GetMethod("HandleLoginAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .Invoke(commands, new object[] { new CommandRequest { Id = "login-1", Type = "login" }, CancellationToken.None });
+                var apiField = typeof(SocketCommandInterface).GetField("_api", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                var api = (SteamPrefillApi)apiField.GetValue(commands)!;
+                commit = (Action<Action>)typeof(SteamPrefillApi).GetField("_commitCredentials", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(api)!;
+                commit(() => saves++);
+                typeof(SocketCommandInterface).GetField("_loginGeneration", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(commands, 2L);
+                apiField.SetValue(commands, new SteamPrefillApi(new StaticAuthProvider("replacement", "replacement")));
+                Assert.Throws<OperationCanceledException>(() => commit(() => saves++));
+            }
+            Assert.Equal(1, saves);
+        }
+
+        [Fact]
         public void DisposeOrphanedApi_ErasesAccountFileAndStorageKey()
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_accountPath)!);
@@ -74,8 +96,8 @@ namespace SteamPrefill.Test
 
             // Before the fix DisposeOrphanedApi only disposed the api, leaving the resurrected token
             // (and its key) on disk to revive the volume login on the next start.
-            Assert.False(File.Exists(_accountPath));
-            Assert.False(File.Exists(_keyPath));
+            Assert.Equal("resurrected-account-store", File.ReadAllText(_accountPath));
+            Assert.Equal("resurrected-storage-key", File.ReadAllText(_keyPath));
         }
     }
 }

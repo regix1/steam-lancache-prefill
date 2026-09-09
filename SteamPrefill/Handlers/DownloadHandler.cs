@@ -1,5 +1,7 @@
 using SteamPrefill.Api;
 
+#nullable enable annotations
+
 namespace SteamPrefill.Handlers
 {
     public sealed class DownloadHandler : IDisposable

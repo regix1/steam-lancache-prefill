@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
 
+#nullable enable annotations
+
 namespace SteamPrefill.Settings
 {
     /// <summary>

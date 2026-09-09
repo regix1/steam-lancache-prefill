@@ -1,5 +1,7 @@
 using System.Text.Json.Serialization;
 
+#nullable enable annotations
+
 namespace SteamPrefill.Api;
 
 /// <summary>
@@ -99,6 +101,7 @@ public class CommandRequest
 /// </summary>
 public class CommandResponse
 {
+    public string? ErrorCode { get; set; }
     /// <summary>
     /// Request ID this response corresponds to
     /// </summary>

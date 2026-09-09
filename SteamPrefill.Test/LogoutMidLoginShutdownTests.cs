@@ -18,7 +18,7 @@ namespace SteamPrefill.Test
         [Fact]
         public async Task Shutdown_AfterCancelledMidInitialize_DoesNotThrow_AndStaysUninitialized()
         {
-            var api = new SteamPrefillApi(new StaticAuthProvider("testuser", "testpass"));
+            using var api = new SteamPrefillApi(new StaticAuthProvider("testuser", "testpass"));
             using var cts = new CancellationTokenSource();
             cts.Cancel();
 

@@ -93,6 +93,9 @@ public static class DaemonMode
 /// </summary>
 public class PrefillProgressUpdate
 {
+    public string? OperationId { get; set; }
+    public string? ErrorCode { get; set; }
+    public bool? RequiresLogin { get; set; }
     [System.Text.Json.Serialization.JsonPropertyName("state")]
     public string State { get; set; } = "idle";
 

@@ -13,13 +13,16 @@ public sealed class SteamPrefillApi : IDisposable
 {
     private readonly ISteamAuthProvider _authProvider;
     private readonly IPrefillProgress _progress;
+    private readonly Action<Action>? _commitCredentials;
+    public event Action<EResult?>? AuthenticationLost;
 
     private SteamManager? _steamManager;
 
     // In-memory cache for selected apps in daemon mode - avoids file I/O issues in containers
     private List<uint>? _selectedAppsCache;
-    private bool _isInitialized;
-    private bool _isDisposed;
+    private volatile bool _isInitialized;
+    private volatile bool _isDisposed;
+    private readonly object _sync = new();
 
     /// <summary>
     /// Creates a new Steam Prefill API instance
@@ -28,16 +31,26 @@ public sealed class SteamPrefillApi : IDisposable
     /// <param name="progress">Optional progress reporter for status updates</param>
     public SteamPrefillApi(
         ISteamAuthProvider authProvider,
-        IPrefillProgress? progress = null)
+        IPrefillProgress? progress = null,
+        Action<Action>? commitCredentials = null)
     {
         _authProvider = authProvider ?? throw new ArgumentNullException(nameof(authProvider));
         _progress = progress ?? NullProgress.Instance;
+        _commitCredentials = commitCredentials;
     }
 
     /// <summary>
     /// Whether the API is initialized and logged into Steam
     /// </summary>
-    public bool IsInitialized => _isInitialized;
+    public bool IsInitialized
+    {
+        get
+        {
+            lock (_sync) return _isInitialized && !_isDisposed && _steamManager?.IsAuthenticated == true;
+        }
+    }
+    internal string? Username => _steamManager?.Username;
+    internal DateTime? AuthExpiryUtc => _steamManager?.AuthExpiryUtc;
 
     /// <summary>
     /// Initializes the API and logs into Steam.
@@ -66,13 +79,30 @@ public sealed class SteamPrefillApi : IDisposable
                 OperatingSystems = new List<OperatingSystem> { OperatingSystem.Windows, OperatingSystem.Linux, OperatingSystem.MacOS }
             };
 
-            _steamManager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress);
+            var manager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress, _commitCredentials);
+            lock (_sync)
+            {
+                if (_isDisposed)
+                {
+                    manager.Dispose();
+                    throw new ObjectDisposedException(nameof(SteamPrefillApi));
+                }
+                _steamManager = manager;
+                manager.AuthenticationLost += result => AuthenticationLost?.Invoke(result);
+            }
 
             await _steamManager.InitializeAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!_steamManager.IsAuthenticated) throw new SteamConnectionException(SteamFailure.AuthLost);
             _isInitialized = true;
 
             _progress.OnOperationCompleted("Initializing Steam connection", timer.Elapsed);
             _progress.OnLog(LogLevel.Info, "Successfully logged into Steam");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _progress.OnLog(LogLevel.Info, "Steam initialization cancelled");
+            throw;
         }
         catch (Exception ex)
         {
@@ -150,7 +180,7 @@ public sealed class SteamPrefillApi : IDisposable
         ThrowIfDisposed();
 
         var appIds = GetSelectedApps();
-        
+
         if (appIds.Count == 0)
         {
             return new SelectedAppsStatus
@@ -185,12 +215,7 @@ public sealed class SteamPrefillApi : IDisposable
         catch (Exception ex)
         {
             _progress.OnError("Failed to get selected apps status", ex);
-            return new SelectedAppsStatus
-            {
-                Apps = new List<AppStatus>(),
-                TotalDownloadSize = 0,
-                Message = $"Error: {ex.Message}"
-            };
+            throw;
         }
     }
 
@@ -225,11 +250,7 @@ public sealed class SteamPrefillApi : IDisposable
         catch (Exception ex)
         {
             _progress.OnError("Failed to check cache status", ex);
-            return new CacheStatusResult
-            {
-                Apps = new List<AppCacheStatus>(),
-                Message = $"Error: {ex.Message}"
-            };
+            throw;
         }
     }
 
@@ -242,7 +263,7 @@ public sealed class SteamPrefillApi : IDisposable
         ThrowIfDisposed();
 
         var appIdList = appIds.ToList();
-        
+
         // Cache in memory for daemon mode reliability
         _selectedAppsCache = appIdList;
 
@@ -291,9 +312,11 @@ public sealed class SteamPrefillApi : IDisposable
     /// <summary>
     /// Runs the prefill operation with the specified options
     /// </summary>
+    [SuppressMessage("Design", "CA1068", Justification = "Preserves existing positional cancellation callers.")]
     public async Task<PrefillResult> PrefillAsync(
         PrefillOptions? options = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IPrefillProgress? progress = null)
     {
         ThrowIfNotInitialized();
         ThrowIfDisposed();
@@ -315,7 +338,8 @@ public sealed class SteamPrefillApi : IDisposable
                 prefillRecentGames: options.PrefillRecentGames,
                 prefillPopularGames: options.PrefillTopGames,
                 prefillRecentlyPurchasedGames: options.PrefillRecentlyPurchased,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken,
+                progress: progress);
 
             _progress.OnOperationCompleted("Prefill operation", timer.Elapsed);
 
@@ -335,11 +359,14 @@ public sealed class SteamPrefillApi : IDisposable
         {
             // Only the message is broadcast to the caller; the exception argument goes to the local log.
             // Without the reason in the message the caller is told the prefill failed and nothing more. [29]
-            _progress.OnError($"Prefill operation failed: {ex.Message}", ex);
+            _progress.OnError("Prefill operation failed", ex);
             return new PrefillResult
             {
                 Success = false,
-                ErrorMessage = ex.Message,
+                ErrorMessage = ex is SteamConnectionException { Failure: not null } ? ex.Message : "The prefill daemon could not complete the request. Try again.",
+                ErrorCode = (ex as SteamConnectionException)?.ErrorCode,
+                RequiresLogin = (ex as SteamConnectionException)?.RequiresLogin == true,
+                Exception = ex,
                 TotalTime = timer.Elapsed
             };
         }
@@ -496,18 +523,22 @@ public sealed class SteamPrefillApi : IDisposable
 
     public void Dispose()
     {
-        if (_isDisposed)
-            return;
-
-        Shutdown();
-        _steamManager?.Dispose();
-        _isDisposed = true;
+        SteamManager? manager;
+        lock (_sync)
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+            _isInitialized = false;
+            manager = _steamManager;
+        }
+        manager?.Shutdown();
+        manager?.Dispose();
     }
 
     private void ThrowIfNotInitialized()
     {
-        if (!_isInitialized)
-            throw new InvalidOperationException("SteamPrefillApi not initialized. Call InitializeAsync first.");
+        if (!IsInitialized)
+            throw new SteamConnectionException(SteamFailure.AuthLost);
     }
 
     private void ThrowIfDisposed()
@@ -567,6 +598,10 @@ public class PrefillOptions
 /// </summary>
 public class PrefillResult
 {
+    public string? ErrorCode { get; init; }
+    public bool? RequiresLogin { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore]
+    internal Exception? Exception { get; init; }
     public bool Success { get; init; }
     public string? ErrorMessage { get; init; }
     public TimeSpan TotalTime { get; init; }

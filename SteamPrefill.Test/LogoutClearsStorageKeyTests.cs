@@ -53,6 +53,21 @@ namespace SteamPrefill.Test
         }
 
         [Fact]
+        public async Task Shutdown_PreservesAccountFileAndStorageKey()
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_accountPath)!);
+            File.WriteAllText(_accountPath, "saved-account");
+            File.WriteAllText(_keyPath, "saved-key");
+            using var commands = new SocketCommandInterface(Path.Combine(Path.GetTempPath(), $"steam-shutdown-{Guid.NewGuid():N}.sock"));
+            var method = typeof(SocketCommandInterface).GetMethod("HandleCommandAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var response = await (Task<CommandResponse>)method.Invoke(commands,
+                new object[] { new CommandRequest { Id = "shutdown-1", Type = "shutdown" }, CancellationToken.None })!;
+            Assert.True(response.Success);
+            Assert.Equal("saved-account", File.ReadAllText(_accountPath));
+            Assert.Equal("saved-key", File.ReadAllText(_keyPath));
+        }
+
+        [Fact]
         public async Task Logout_DeletesStorageKeyAlongsideAccountFile()
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_accountPath)!);

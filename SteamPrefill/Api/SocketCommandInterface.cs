@@ -26,20 +26,16 @@ public sealed class SocketCommandInterface : IDisposable
     private CancellationTokenSource? _loginCts;
     private SteamPrefillApi? _api;
     private Task? _loginTask;
-    private bool _isLoggedIn;
+    private bool _isLoggedIn => _api?.IsInitialized == true;
+    private readonly object _lifecycle = new();
+    private SocketProgress? _run;
+    private Task _statusPublication = Task.CompletedTask;
     private bool _isLoggingIn;
     private bool _disposed;
 
-    // Bumped by logout (and cancel-login) so a login task that is still unwinding (or already
-    // orphaned by a cancellation that never got observed) can tell it has been superseded and must
-    // not resurrect _isLoggedIn/_api for whatever now owns them. Written from the socket command
-    // loop, read from thread-pool login-task continuations after an await - always accessed via
-    // Interlocked, never a plain read/increment.
+    // All generation changes and credential commits share the lifecycle gate.
     private long _loginGeneration;
 
-    // How long logout waits for an in-flight login task to unwind before force-cleaning up
-    // anyway. Logout must never hang on a stuck login.
-    private static readonly TimeSpan LogoutLoginTaskTimeout = TimeSpan.FromSeconds(8);
 
     // Auto-login challenge storage
     private readonly Dictionary<string, AutoLoginChallengeData> _pendingAutoLoginChallenges = new();
@@ -50,6 +46,8 @@ public sealed class SocketCommandInterface : IDisposable
         "login",
         "logout",
         "status",
+        "shutdown",
+        "cancel-prefill",
         "cancel-login",
         "provide-credential",
         "get-auto-login-challenge",
@@ -100,7 +98,7 @@ public sealed class SocketCommandInterface : IDisposable
     public async Task StopAsync()
     {
         _cts.Cancel();
-        await _prefillOperation.CancelAndWaitAsync();
+        await EndSessionAsync(false);
         await _socketServer.StopAsync();
         _progress.OnLog(LogLevel.Info, "Socket command interface stopped");
     }
@@ -147,7 +145,7 @@ public sealed class SocketCommandInterface : IDisposable
                 {
                     Id = request.Id,
                     Success = false,
-                    Error = $"Unknown command type: {request.Type}",
+                    Error = "The prefill daemon could not complete the request. Try again.",
                     CompletedAt = DateTime.UtcNow
                 }
             };
@@ -158,12 +156,14 @@ public sealed class SocketCommandInterface : IDisposable
         }
         catch (Exception ex)
         {
-            _progress.OnLog(LogLevel.Error, $"Error handling command {request.Type}: {ex.Message}");
+            FileLogger.LogException((ex as SteamConnectionException)?.GetContext(request.Type, request.Id) ?? $"Command={request.Type} operationId={request.Id}", ex);
             return new CommandResponse
             {
                 Id = request.Id,
                 Success = false,
-                Error = ex.Message,
+                Error = ex is SteamConnectionException { Failure: not null } ? ex.Message : "The prefill daemon could not complete the request. Try again.",
+                ErrorCode = (ex as SteamConnectionException)?.ErrorCode,
+                RequiresLogin = (ex as SteamConnectionException)?.RequiresLogin == true,
                 CompletedAt = DateTime.UtcNow
             };
         }
@@ -171,195 +171,150 @@ public sealed class SocketCommandInterface : IDisposable
 
     private Task<CommandResponse> HandleLoginAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        if (_isLoggedIn)
+        lock (_lifecycle)
         {
-            _progress.OnLog(LogLevel.Info, "Already logged in");
+            if (!_isLoggedIn && !_isLoggingIn) StartLogin(null, null);
             return Task.FromResult(new CommandResponse
             {
                 Id = request.Id,
                 Success = true,
-                Message = "Already logged in",
+                Message = _isLoggedIn ? "Already logged in" : "Login started - awaiting credentials",
                 CompletedAt = DateTime.UtcNow
             });
         }
+    }
 
-        if (_isLoggingIn)
-        {
-            _progress.OnLog(LogLevel.Info, "Login already in progress");
-            return Task.FromResult(new CommandResponse
-            {
-                Id = request.Id,
-                Success = true,
-                Message = "Login already in progress",
-                CompletedAt = DateTime.UtcNow
-            });
-        }
-
-        _progress.OnLog(LogLevel.Info, "Starting secure login process via socket...");
+    private void StartLogin(string? username, string? token)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _cts.Token.ThrowIfCancellationRequested();
+        var previous = _api;
+        var previousLogin = _loginTask;
+        var generation = ++_loginGeneration;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var loginToken = cancellation.Token;
+        _loginCts = cancellation;
         _isLoggingIn = true;
-
-        // Create a login-specific cancellation token
-        _loginCts?.Dispose();
-        _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        var loginCts = _loginCts;
-
-        // Captured now: if logout runs before this task settles, it bumps _loginGeneration so a
-        // late-completing (superseded) task can tell and must not touch shared login state.
-        var loginGeneration = Interlocked.Increment(ref _loginGeneration);
-
-        // Create API with socket auth provider
-        var api = new SteamPrefillApi(_authProvider, _progress);
+        SteamPrefillApi? api = null;
+        void Commit(Action save)
+        {
+            lock (_lifecycle)
+            {
+                if (_disposed || generation != _loginGeneration || !ReferenceEquals(api, _api) ||
+                    cancellation.IsCancellationRequested || (!_isLoggingIn && api?.IsInitialized != true))
+                    throw new OperationCanceledException(loginToken);
+                save();
+            }
+        }
+        api = new SteamPrefillApi(_authProvider, _progress, Commit);
         _api = api;
-
-        // Run login in background task so the command loop isn't blocked
-        // This allows provide-credential commands to be processed while login is waiting
+        api.AuthenticationLost += result => HandleAuthenticationLost(api, generation, result);
+        if (username != null && token != null)
+        {
+            var account = UserAccountStore.LoadFromFile(Commit);
+            account.SetCredentialsFromToken(username, token);
+        }
         _loginTask = Task.Run(async () =>
         {
             try
             {
-                // This will trigger credential challenges via socket
-                await api.InitializeAsync(loginCts.Token);
-
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                if (previousLogin != null) await previousLogin;
+                if (previous != null) DisposeOrphanedApi(previous);
+                await api.InitializeAsync(cancellation.Token);
+                lock (_lifecycle)
                 {
-                    _progress.OnLog(LogLevel.Info, "Login superseded by logout - discarding orphaned session");
-                    DisposeOrphanedApi(api);
-                    return;
+                    if (generation != _loginGeneration || !ReferenceEquals(_api, api)) return;
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    if (!api.IsInitialized) throw new SteamConnectionException(SteamFailure.AuthLost);
+                    _isLoggingIn = false;
+                    _statusPublication = PublishStatusAsync(_statusPublication, "logged-in", "Authenticated and ready for commands");
                 }
-
-                _isLoggedIn = true;
-                _isLoggingIn = false;
-                _progress.OnLog(LogLevel.Info, "Login successful - commands now available");
-
-                await BroadcastStatusAsync("logged-in", "Authenticated and ready for commands");
-            }
-            catch (OperationCanceledException)
-            {
-                _progress.OnLog(LogLevel.Info, "Login cancelled");
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
-                {
-                    DisposeOrphanedApi(api);
-                    return;
-                }
-                _isLoggingIn = false;
-                CleanupApiInstance();
-                await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
             }
             catch (Exception ex)
             {
-                _progress.OnLog(LogLevel.Error, $"Login failed: {ex.Message}");
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                if (ex is not OperationCanceledException) FileLogger.LogException("Steam login failed", ex);
+                lock (_lifecycle)
                 {
-                    DisposeOrphanedApi(api);
-                    return;
+                    if (generation == _loginGeneration && ReferenceEquals(_api, api))
+                    {
+                        _api = null;
+                        if (_isLoggingIn)
+                            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", "Steam sign-in did not complete. Sign in again.");
+                        _isLoggingIn = false;
+                    }
                 }
-                _isLoggingIn = false;
-                CleanupApiInstance();
-                await BroadcastStatusAsync("awaiting-login", $"Login failed: {ex.Message}");
             }
             finally
             {
-                if (loginGeneration == Interlocked.Read(ref _loginGeneration))
+                bool orphan;
+                lock (_lifecycle)
                 {
-                    _loginCts?.Dispose();
-                    _loginCts = null;
+                    orphan = !ReferenceEquals(_api, api) || generation != _loginGeneration;
+                    if (ReferenceEquals(_loginCts, cancellation)) _loginCts = null;
                 }
+                if (orphan) DisposeOrphanedApi(api);
+                cancellation.Dispose();
             }
-        }, loginCts.Token);
-
-        // Return immediately - login process continues in background
-        return Task.FromResult(new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Message = "Login started - awaiting credentials",
-            CompletedAt = DateTime.UtcNow
         });
     }
 
-    private async Task<CommandResponse> HandleLogoutAsync(
-        CommandRequest request,
-        CancellationToken cancellationToken)
+    private void HandleAuthenticationLost(SteamPrefillApi api, long generation, EResult? result)
     {
-        if (_prefillOperation.IsRunning)
+        lock (_lifecycle)
         {
-            await _prefillOperation.CancelAndWaitAsync(cancellationToken);
+            if (generation != _loginGeneration || !ReferenceEquals(_api, api)) return;
+            _isLoggingIn = false;
+            _run?.SelectTerminal(OwnedOperationStatus.Failed, new SteamConnectionException(SteamFailure.AuthLost));
+            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login",
+                new SteamConnectionException(SteamFailure.AuthLost).Message);
+            if (_run != null) _ = _prefillOperation.CancelAndWaitAsync();
         }
+    }
 
-        // Bump the generation so any login task still unwinding (or one that never observes
-        // the cancellation below) cannot resurrect _isLoggedIn/_api once it finally settles.
-        Interlocked.Increment(ref _loginGeneration);
-
-        // Logout while a login is in progress: cancel it the same way cancel-login does, then
-        // fall through to the same cleanup + credential wipe below (cancel-then-forget).
-        if (_isLoggingIn)
+    private async Task EndSessionAsync(bool erase, bool onlyLogin = false)
+    {
+        SteamPrefillApi? api;
+        Task? login;
+        CancellationTokenSource? cancellation;
+        Task publication;
+        Task completion;
+        lock (_lifecycle)
         {
+            if (onlyLogin && !_isLoggingIn) return;
+            ++_loginGeneration;
+            _pendingAutoLoginChallenges.Clear();
+            api = _api;
+            _api = null;
+            _isLoggingIn = false;
+            cancellation = _loginCts;
+            _loginCts = null;
+            login = _loginTask;
+            _run?.SelectTerminal(OwnedOperationStatus.Cancelled);
+            publication = _run?.Publication.Task ?? Task.CompletedTask;
+            completion = _prefillOperation.CancelAndWaitAsync();
+            if (erase) EraseAccountStore(_progress);
+            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", "Login required");
             _authProvider.CancelPendingRequest();
-
-            try
-            {
-                if (_loginCts != null)
-                    await _loginCts.CancelAsync();
-            }
-            catch { /* ignore if already disposed */ }
-
-            // Bounded wait for the login task to unwind. A stuck login must never hang logout -
-            // if it doesn't finish in time we force-cleanup below anyway; the generation bump
-            // above keeps a late finish from resurrecting state.
-            var loginTask = _loginTask;
-            if (loginTask != null)
-            {
-                await Task.WhenAny(loginTask, Task.Delay(LogoutLoginTaskTimeout, cancellationToken));
-            }
         }
+        try { cancellation?.Cancel(); }
+        catch (ObjectDisposedException) { /* Login already completed. */ }
+        await completion;
+        await publication;
+        if (api != null) DisposeOrphanedApi(api);
+        if (login != null) await login;
+        await _statusPublication;
+    }
 
-        CleanupApiInstance();
-
-        // Wipe the persisted account file AND its storage.key so the refresh token cannot linger
-        // (or be silently re-decrypted by a later login re-using the same key) after logout.
-        EraseAccountStore(_progress);
-
-        _progress.OnLog(LogLevel.Info, "Logged out");
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Message = "Logged out successfully",
-            CompletedAt = DateTime.UtcNow
-        };
+    private async Task<CommandResponse> HandleLogoutAsync(CommandRequest request, CancellationToken cancellationToken)
+    {
+        await EndSessionAsync(true);
+        return new CommandResponse { Id = request.Id, Success = true, Message = "Logged out successfully", CompletedAt = DateTime.UtcNow };
     }
 
     private async Task<CommandResponse> HandleCancelLoginAsync(CommandRequest request)
     {
-        _progress.OnLog(LogLevel.Info, "Cancelling login...");
-
-        // Bump the generation first, same as logout: a login task that races past this
-        // cancellation (or whose exception is swallowed) must not be able to resurrect
-        // _isLoggedIn/_api once it finally settles, even though this handler isn't a logout.
-        Interlocked.Increment(ref _loginGeneration);
-
-        // Cancel any pending credential requests
-        _authProvider.CancelPendingRequest();
-
-        // Cancel login-specific token
-        try
-        {
-            if (_loginCts != null)
-                await _loginCts.CancelAsync();
-        }
-        catch { /* ignore if already disposed */ }
-
-        CleanupApiInstance();
-        await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Message = "Login cancelled",
-            CompletedAt = DateTime.UtcNow
-        };
+        await EndSessionAsync(false, true);
+        return new CommandResponse { Id = request.Id, Success = true, Message = "Login cancelled", CompletedAt = DateTime.UtcNow };
     }
 
     internal static DaemonCommandLane ClassifyCommand(string commandType)
@@ -375,44 +330,19 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private async Task<CommandResponse> HandleCancelPrefillAsync(
-        CommandRequest request,
-        CancellationToken cancellationToken)
+    private async Task<CommandResponse> HandleCancelPrefillAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        if (!_prefillOperation.IsRunning)
+        Task publication;
+        Task completion;
+        lock (_lifecycle)
         {
-            return new CommandResponse
-            {
-                Id = request.Id,
-                Success = true,
-                Message = "No prefill in progress",
-                CompletedAt = DateTime.UtcNow
-            };
+            _run?.SelectTerminal(OwnedOperationStatus.Cancelled);
+            publication = _run?.Publication.Task ?? Task.CompletedTask;
+            completion = _prefillOperation.CancelAndWaitAsync(cancellationToken);
         }
-
-        _progress.OnLog(LogLevel.Info, "Cancelling prefill...");
-
-        var result = await _prefillOperation.CancelAndWaitAsync(cancellationToken);
-        if (result.Status == OwnedOperationStatus.Failed)
-        {
-            return new CommandResponse
-            {
-                Id = request.Id,
-                Success = false,
-                Error = result.Exception?.Message ?? "Prefill failed while cancellation was requested",
-                CompletedAt = DateTime.UtcNow
-            };
-        }
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Message = result.Status == OwnedOperationStatus.Cancelled
-                ? "Prefill cancelled"
-                : "No prefill in progress",
-            CompletedAt = DateTime.UtcNow
-        };
+        await completion;
+        await publication.WaitAsync(cancellationToken);
+        return new CommandResponse { Id = request.Id, Success = true, Message = "Prefill cancelled", CompletedAt = DateTime.UtcNow };
     }
 
     private CommandResponse HandleProvideCredential(CommandRequest request)
@@ -471,55 +401,59 @@ public sealed class SocketCommandInterface : IDisposable
 
     private CommandResponse HandleGetAutoLoginChallenge(CommandRequest request)
     {
-        using var ecdh = System.Security.Cryptography.ECDiffieHellman.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
-        var parameters = ecdh.ExportParameters(true);
-
-        // Export public key in uncompressed point format
-        var serverPublicKey = new byte[65];
-        serverPublicKey[0] = 0x04; // Uncompressed point indicator
-        Array.Copy(parameters.Q.X!, 0, serverPublicKey, 1, 32);
-        Array.Copy(parameters.Q.Y!, 0, serverPublicKey, 33, 32);
-
-        var challengeId = Guid.NewGuid().ToString("N");
-        var expiresAt = DateTime.UtcNow.AddMinutes(5);
-
-        // Store challenge data
-        var challengeData = new AutoLoginChallengeData
+        lock (_lifecycle)
         {
-            ChallengeId = challengeId,
-            ServerPrivateKey = parameters,
-            ServerPublicKey = serverPublicKey,
-            ExpiresAt = expiresAt
-        };
+            using var ecdh = System.Security.Cryptography.ECDiffieHellman.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+            var parameters = ecdh.ExportParameters(true);
 
-        _pendingAutoLoginChallenges[challengeId] = challengeData;
+            // Export public key in uncompressed point format
+            var serverPublicKey = new byte[65];
+            serverPublicKey[0] = 0x04; // Uncompressed point indicator
+            Array.Copy(parameters.Q.X!, 0, serverPublicKey, 1, 32);
+            Array.Copy(parameters.Q.Y!, 0, serverPublicKey, 33, 32);
 
-        // Clean up expired challenges
-        var expiredChallenges = _pendingAutoLoginChallenges
-            .Where(kvp => kvp.Value.ExpiresAt < DateTime.UtcNow)
-            .Select(kvp => kvp.Key)
-            .ToList();
-        foreach (var expiredId in expiredChallenges)
-        {
-            _pendingAutoLoginChallenges.Remove(expiredId);
-        }
+            var challengeId = Guid.NewGuid().ToString("N");
+            var expiresAt = DateTime.UtcNow.AddMinutes(5);
 
-        _progress.OnLog(LogLevel.Info, $"Auto-login challenge created: {challengeId}");
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Data = new CredentialChallenge
+            // Store challenge data
+            var challengeData = new AutoLoginChallengeData
             {
                 ChallengeId = challengeId,
-                CredentialType = "auto-login",
-                ServerPublicKey = System.Convert.ToBase64String(serverPublicKey),
-                CreatedAt = DateTime.UtcNow,
+                ServerPrivateKey = parameters,
+                ServerPublicKey = serverPublicKey,
+                Generation = _loginGeneration,
                 ExpiresAt = expiresAt
-            },
-            CompletedAt = DateTime.UtcNow
-        };
+            };
+
+            _pendingAutoLoginChallenges[challengeId] = challengeData;
+
+            // Clean up expired challenges
+            var expiredChallenges = _pendingAutoLoginChallenges
+                .Where(kvp => kvp.Value.ExpiresAt < DateTime.UtcNow)
+                .Select(kvp => kvp.Key)
+                .ToList();
+            foreach (var expiredId in expiredChallenges)
+            {
+                _pendingAutoLoginChallenges.Remove(expiredId);
+            }
+
+            _progress.OnLog(LogLevel.Info, $"Auto-login challenge created: {challengeId}");
+
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = true,
+                Data = new CredentialChallenge
+                {
+                    ChallengeId = challengeId,
+                    CredentialType = "auto-login",
+                    ServerPublicKey = System.Convert.ToBase64String(serverPublicKey),
+                    CreatedAt = DateTime.UtcNow,
+                    ExpiresAt = expiresAt
+                },
+                CompletedAt = DateTime.UtcNow
+            };
+        }
     }
 
     private async Task<CommandResponse> HandleProvideAutoLoginAsync(CommandRequest request, CancellationToken cancellationToken)
@@ -542,33 +476,38 @@ public sealed class SocketCommandInterface : IDisposable
             };
         }
 
-        // Get challenge from dictionary
-        if (!_pendingAutoLoginChallenges.TryGetValue(challengeId, out var challengeData))
+        AutoLoginChallengeData? challengeData;
+        lock (_lifecycle)
         {
-            return new CommandResponse
+            // Get challenge from dictionary
+            if (!_pendingAutoLoginChallenges.TryGetValue(challengeId, out challengeData))
             {
-                Id = request.Id,
-                Success = false,
-                Error = "Invalid or expired challenge ID",
-                CompletedAt = DateTime.UtcNow
-            };
-        }
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = false,
+                    Error = "Invalid or expired challenge ID",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
 
-        // Validate not expired
-        if (challengeData.ExpiresAt < DateTime.UtcNow)
-        {
+            // Validate not expired
+            if (challengeData.ExpiresAt < DateTime.UtcNow)
+            {
+                _pendingAutoLoginChallenges.Remove(challengeId);
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = false,
+                    Error = "Challenge has expired",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+
+            // Remove from dictionary (one-time use)
             _pendingAutoLoginChallenges.Remove(challengeId);
-            return new CommandResponse
-            {
-                Id = request.Id,
-                Success = false,
-                Error = "Challenge has expired",
-                CompletedAt = DateTime.UtcNow
-            };
-        }
 
-        // Remove from dictionary (one-time use)
-        _pendingAutoLoginChallenges.Remove(challengeId);
+        }
 
         try
         {
@@ -634,192 +573,66 @@ public sealed class SocketCommandInterface : IDisposable
 
             _progress.OnLog(LogLevel.Info, $"Auto-login credentials received for user: {autoLoginData.Username}");
 
-            // Set credentials in UserAccountStore
-            var accountStore = UserAccountStore.LoadFromFile();
-            accountStore.SetCredentialsFromToken(autoLoginData.Username, autoLoginData.RefreshToken);
-
-            // For auto-login, we wait for login to complete (no interactive credentials needed)
-            // This is different from regular login which runs in background to allow credential prompts
-            if (_isLoggedIn)
+            Task? login;
+            SteamPrefillApi? acceptedApi;
+            long acceptedGeneration;
+            lock (_lifecycle)
             {
-                _progress.OnLog(LogLevel.Info, "Already logged in");
-                return new CommandResponse
-                {
-                    Id = request.Id,
-                    Success = true,
-                    Message = "Already logged in",
-                    CompletedAt = DateTime.UtcNow
-                };
-            }
-
-            if (_isLoggingIn)
-            {
-                // Wait for existing login to complete
-                if (_loginTask != null)
-                {
-                    await _loginTask;
-                }
-
-                return new CommandResponse
-                {
-                    Id = request.Id,
-                    Success = _isLoggedIn,
-                    Message = _isLoggedIn ? "Login completed" : "Login failed",
-                    CompletedAt = DateTime.UtcNow
-                };
-            }
-
-            _progress.OnLog(LogLevel.Info, "Starting auto-login with refresh token...");
-            _isLoggingIn = true;
-
-            // Create a login-specific cancellation token
-            _loginCts?.Dispose();
-            _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
-            var loginCts = _loginCts;
-            var loginGeneration = Interlocked.Increment(ref _loginGeneration);
-
-            // Create API with a static auth provider (refresh token login doesn't need interactive auth)
-            var api = new SteamPrefillApi(_authProvider, _progress);
-            _api = api;
-
-            try
-            {
-                // Wait for login to complete - auto-login with refresh token should not require credentials
-                await api.InitializeAsync(loginCts.Token);
-
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
-                {
-                    _progress.OnLog(LogLevel.Info, "Auto-login superseded by logout - discarding orphaned session");
-                    DisposeOrphanedApi(api);
+                if (challengeData.Generation != _loginGeneration)
                     return new CommandResponse
                     {
                         Id = request.Id,
                         Success = false,
-                        Error = "Auto-login superseded by logout",
+                        Error = "The sign-in attempt has ended. Sign in again.",
                         CompletedAt = DateTime.UtcNow
                     };
-                }
-
-                _isLoggedIn = true;
-                _isLoggingIn = false;
-                _progress.OnLog(LogLevel.Info, "Auto-login successful - commands now available");
-
-                await BroadcastStatusAsync("logged-in", "Authenticated and ready for commands");
-
+                if (!_isLoggedIn && !_isLoggingIn) StartLogin(autoLoginData.Username, autoLoginData.RefreshToken);
+                login = _loginTask;
+                acceptedApi = _api;
+                acceptedGeneration = _loginGeneration;
+            }
+            if (login != null) await login.WaitAsync(cancellationToken);
+            lock (_lifecycle)
+            {
+                var ready = acceptedGeneration == _loginGeneration && ReferenceEquals(acceptedApi, _api) && _isLoggedIn;
                 return new CommandResponse
                 {
                     Id = request.Id,
-                    Success = true,
-                    Message = "Auto-login successful",
+                    Success = ready,
+                    Message = ready ? "Auto-login successful" : "Steam sign-in did not complete. Sign in again.",
+                    RequiresLogin = !ready,
                     CompletedAt = DateTime.UtcNow
                 };
-            }
-            catch (OperationCanceledException)
-            {
-                _progress.OnLog(LogLevel.Info, "Auto-login cancelled");
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
-                {
-                    DisposeOrphanedApi(api);
-                }
-                else
-                {
-                    _isLoggingIn = false;
-                    CleanupApiInstance();
-                    await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
-                }
-
-                return new CommandResponse
-                {
-                    Id = request.Id,
-                    Success = false,
-                    Error = "Auto-login cancelled",
-                    CompletedAt = DateTime.UtcNow
-                };
-            }
-            catch (Exception ex)
-            {
-                _progress.OnLog(LogLevel.Error, $"Auto-login failed: {ex.Message}");
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
-                {
-                    DisposeOrphanedApi(api);
-                }
-                else
-                {
-                    _isLoggingIn = false;
-                    CleanupApiInstance();
-                    await BroadcastStatusAsync("awaiting-login", $"Auto-login failed: {ex.Message}");
-                }
-
-                return new CommandResponse
-                {
-                    Id = request.Id,
-                    Success = false,
-                    Error = $"Auto-login failed: {ex.Message}",
-                    CompletedAt = DateTime.UtcNow
-                };
-            }
-            finally
-            {
-                if (loginGeneration == Interlocked.Read(ref _loginGeneration))
-                {
-                    _loginCts?.Dispose();
-                    _loginCts = null;
-                }
             }
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+    }
+
+    private CommandResponse HandleStatus(CommandRequest request)
+    {
+        lock (_lifecycle)
         {
-            _progress.OnLog(LogLevel.Error, $"Failed to decrypt auto-login credentials: {ex.Message}");
+            var ready = _api?.IsInitialized == true;
             return new CommandResponse
             {
                 Id = request.Id,
-                Success = false,
-                Error = $"Failed to decrypt credentials: {ex.Message}",
+                Success = true,
+                Data = new StatusData
+                {
+                    IsLoggedIn = ready,
+                    IsInitialized = ready,
+                    AuthExpiryUtc = ready ? _api?.AuthExpiryUtc : null,
+                    Username = ready ? _api?.Username : null
+                },
                 CompletedAt = DateTime.UtcNow
             };
         }
     }
 
-    private CommandResponse HandleStatus(CommandRequest request)
-    {
-        DateTime? authExpiryUtc = null;
-        string? username = null;
-
-        // Surface the refresh-token expiry + username so a manager can show a login countdown.
-        // Only meaningful when logged in; reuses the existing JWT ValidTo read (no new crypto).
-        if (_isLoggedIn)
-        {
-            try
-            {
-                var accountStore = UserAccountStore.LoadFromFile();
-                authExpiryUtc = accountStore.GetAccessTokenExpiryUtc();
-                username = string.IsNullOrEmpty(accountStore.CurrentUsername) ? null : accountStore.CurrentUsername;
-            }
-            catch (Exception ex)
-            {
-                _progress.OnLog(LogLevel.Warning, $"Could not read auth expiry for status: {ex.Message}");
-            }
-        }
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Data = new StatusData
-            {
-                IsLoggedIn = _isLoggedIn,
-                IsInitialized = _api?.IsInitialized ?? false,
-                AuthExpiryUtc = authExpiryUtc,
-                Username = username
-            },
-            CompletedAt = DateTime.UtcNow
-        };
-    }
-
     private async Task<CommandResponse> HandleGetOwnedGamesAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        EnsureLoggedIn();
-        var games = await _api!.GetOwnedGamesAsync(cancellationToken);
+        var api = EnsureLoggedIn();
+        var games = await api.GetOwnedGamesAsync(cancellationToken);
 
         return new CommandResponse
         {
@@ -832,8 +645,8 @@ public sealed class SocketCommandInterface : IDisposable
 
     private CommandResponse HandleGetSelectedApps(CommandRequest request)
     {
-        EnsureLoggedIn();
-        var selected = _api!.GetSelectedApps();
+        var api = EnsureLoggedIn();
+        var selected = api.GetSelectedApps();
 
         return new CommandResponse
         {
@@ -846,7 +659,7 @@ public sealed class SocketCommandInterface : IDisposable
 
     private CommandResponse HandleSetSelectedApps(CommandRequest request)
     {
-        EnsureLoggedIn();
+        var api = EnsureLoggedIn();
 
         var appIdsJson = request.Parameters?.GetValueOrDefault("appIds");
         if (string.IsNullOrEmpty(appIdsJson))
@@ -907,7 +720,7 @@ public sealed class SocketCommandInterface : IDisposable
             };
         }
 
-        _api!.SetSelectedApps(appIds);
+        api.SetSelectedApps(appIds);
         _progress.OnLog(LogLevel.Info, $"Set {appIds.Count} selected apps");
 
         return new CommandResponse
@@ -919,93 +732,127 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private async Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
+    private Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        EnsureLoggedIn();
-
-        if (_prefillOperation.IsRunning)
+        lock (_lifecycle)
         {
-            return new CommandResponse
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureLoggedIn();
+
+            if (_run != null)
+            {
+                return Task.FromResult(new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = false,
+                    Error = "A prefill is already in progress",
+                    CompletedAt = DateTime.UtcNow
+                });
+            }
+
+            var options = new PrefillOptions();
+
+            if (request.Parameters != null)
+            {
+                if (bool.TryParse(request.Parameters.GetValueOrDefault("all"), out var all))
+                    options.DownloadAllOwnedGames = all;
+                if (bool.TryParse(request.Parameters.GetValueOrDefault("recent"), out var recent))
+                    options.PrefillRecentGames = recent;
+                if (bool.TryParse(request.Parameters.GetValueOrDefault("recently_purchased"), out var recentlyPurchased))
+                    options.PrefillRecentlyPurchased = recentlyPurchased;
+                if (int.TryParse(request.Parameters.GetValueOrDefault("top"), out var top))
+                    options.PrefillTopGames = top;
+                if (bool.TryParse(request.Parameters.GetValueOrDefault("force"), out var force))
+                    options.Force = force;
+                AppConfig.MaxConcurrencyOverride = null;
+                if (int.TryParse(request.Parameters.GetValueOrDefault("maxConcurrency"), out var maxConcurrency) && maxConcurrency > 0)
+                    AppConfig.MaxConcurrencyOverride = maxConcurrency;
+
+                // Parse operating systems
+                var osParam = request.Parameters.GetValueOrDefault("os");
+                if (!string.IsNullOrEmpty(osParam))
+                {
+                    var osList = new List<OperatingSystem>();
+                    foreach (var os in osParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        if (OperatingSystem.TryFromValue(os.ToLowerInvariant(), out var operatingSystem))
+                        {
+                            osList.Add(operatingSystem);
+                        }
+                    }
+                    if (osList.Count > 0)
+                    {
+                        options.OperatingSystems = osList;
+                    }
+                }
+
+                // Process cached depot data
+                var cachedDepotsJson = request.Parameters.GetValueOrDefault("cachedDepots");
+                if (!string.IsNullOrEmpty(cachedDepotsJson))
+                {
+                    try
+                    {
+                        var cachedDepots = JsonSerializer.Deserialize(cachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
+                        if (cachedDepots != null && cachedDepots.Count > 0)
+                        {
+                            _progress.OnLog(LogLevel.Info, $"Setting {cachedDepots.Count} cached depot manifests");
+                            _api!.SetCachedManifests(cachedDepots.Select(d => (d.DepotId, d.ManifestId)));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _progress.OnLog(LogLevel.Warning, $"Failed to process cachedDepots: {ex.Message}");
+                    }
+                }
+            }
+
+            lock (_lifecycle)
+            {
+                EnsureLoggedIn();
+                if (_run != null) throw new InvalidOperationException("A prefill is already in progress");
+                var api = _api!;
+                var generation = _loginGeneration;
+                var progress = new SocketProgress(operationId: request.Id, sync: _lifecycle,
+                    isCurrent: () => generation == _loginGeneration && ReferenceEquals(api, _api) && api.IsInitialized,
+                    enableDebugLogs: AppConfig.DebugLogs)
+                { SocketServer = _socketServer };
+                _run = progress;
+                _prefillOperation.StartAsync(
+                    operationToken => RunPrefillOperationAsync(
+                        (value, token) => api.PrefillAsync(value, token, progress),
+                        options, progress, operationToken), _cts.Token).GetAwaiter().GetResult();
+                _ = CompletePrefillAsync(progress, _prefillOperation.WaitAsync(CancellationToken.None));
+            }
+
+            return Task.FromResult(new CommandResponse
             {
                 Id = request.Id,
-                Success = false,
-                Error = "A prefill is already in progress",
+                Success = true,
+                Message = "Prefill started",
                 CompletedAt = DateTime.UtcNow
-            };
+            });
         }
+    }
 
-        var options = new PrefillOptions();
-
-        if (request.Parameters != null)
+    private async Task CompletePrefillAsync(SocketProgress progress, Task<OwnedOperationResult> completion)
+    {
+        try
         {
-            if (bool.TryParse(request.Parameters.GetValueOrDefault("all"), out var all))
-                options.DownloadAllOwnedGames = all;
-            if (bool.TryParse(request.Parameters.GetValueOrDefault("recent"), out var recent))
-                options.PrefillRecentGames = recent;
-            if (bool.TryParse(request.Parameters.GetValueOrDefault("recently_purchased"), out var recentlyPurchased))
-                options.PrefillRecentlyPurchased = recentlyPurchased;
-            if (int.TryParse(request.Parameters.GetValueOrDefault("top"), out var top))
-                options.PrefillTopGames = top;
-            if (bool.TryParse(request.Parameters.GetValueOrDefault("force"), out var force))
-                options.Force = force;
-            AppConfig.MaxConcurrencyOverride = null;
-            if (int.TryParse(request.Parameters.GetValueOrDefault("maxConcurrency"), out var maxConcurrency) && maxConcurrency > 0)
-                AppConfig.MaxConcurrencyOverride = maxConcurrency;
-
-            // Parse operating systems
-            var osParam = request.Parameters.GetValueOrDefault("os");
-            if (!string.IsNullOrEmpty(osParam))
+            var result = await completion;
+            await progress.PublishTerminalAsync(result);
+        }
+        catch (Exception ex)
+        {
+            FileLogger.LogException("Prefill terminal publication failed", ex);
+        }
+        finally
+        {
+            lock (_lifecycle)
             {
-                var osList = new List<OperatingSystem>();
-                foreach (var os in osParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                {
-                    if (OperatingSystem.TryFromValue(os.ToLowerInvariant(), out var operatingSystem))
-                    {
-                        osList.Add(operatingSystem);
-                    }
-                }
-                if (osList.Count > 0)
-                {
-                    options.OperatingSystems = osList;
-                }
-            }
-
-            // Process cached depot data
-            var cachedDepotsJson = request.Parameters.GetValueOrDefault("cachedDepots");
-            if (!string.IsNullOrEmpty(cachedDepotsJson))
-            {
-                try
-                {
-                    var cachedDepots = JsonSerializer.Deserialize(cachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
-                    if (cachedDepots != null && cachedDepots.Count > 0)
-                    {
-                        _progress.OnLog(LogLevel.Info, $"Setting {cachedDepots.Count} cached depot manifests");
-                        _api!.SetCachedManifests(cachedDepots.Select(d => (d.DepotId, d.ManifestId)));
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _progress.OnLog(LogLevel.Warning, $"Failed to process cachedDepots: {ex.Message}");
-                }
+                if (ReferenceEquals(_run, progress)) _run = null;
+                progress.Publication.TrySetResult();
             }
         }
-
-        await _prefillOperation.StartAsync(
-            operationToken => RunPrefillOperationAsync(
-                _api!.PrefillAsync,
-                options,
-                _progress,
-                operationToken),
-            _cts.Token);
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Message = "Prefill started",
-            CompletedAt = DateTime.UtcNow
-        };
     }
 
     internal static async Task RunPrefillOperationAsync(
@@ -1017,23 +864,24 @@ public sealed class SocketCommandInterface : IDisposable
         try
         {
             var result = await prefillAsync(options, cancellationToken);
-            if (result.Success)
-            {
-                progress.OnLog(LogLevel.Info, "Prefill completed successfully");
-            }
-            else
-            {
-                progress.OnLog(LogLevel.Warning, $"Prefill completed with errors: {result.ErrorMessage}");
-            }
+            if (!result.Success)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(result.Exception ??
+                    new SteamConnectionException("The prefill daemon could not complete the request. Try again.")).Throw();
+            progress.SelectTerminal(OwnedOperationStatus.Completed);
+            if (progress.Terminal?.Exception != null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(progress.Terminal.Exception).Throw();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            progress.OnCancelled("Prefill cancelled by user");
+            progress.SelectTerminal(OwnedOperationStatus.Cancelled);
+            if (progress.Terminal?.Exception != null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(progress.Terminal.Exception).Throw();
             throw;
         }
         catch (Exception ex)
         {
-            progress.OnError($"Prefill failed: {ex.Message}", ex);
+            FileLogger.LogException((ex as SteamConnectionException)?.GetContext("prefill", progress.OperationId) ?? "Prefill failed", ex);
+            progress.SelectTerminal(OwnedOperationStatus.Failed, ex);
             throw;
         }
     }
@@ -1072,7 +920,7 @@ public sealed class SocketCommandInterface : IDisposable
 
     private async Task<CommandResponse> HandleGetSelectedAppsStatusAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        EnsureLoggedIn();
+        var api = EnsureLoggedIn();
 
         // Parse operating systems if provided
         var osParam = request.Parameters?.GetValueOrDefault("os");
@@ -1088,7 +936,7 @@ public sealed class SocketCommandInterface : IDisposable
             }
             if (osList.Count > 0)
             {
-                _api!.UpdateDownloadOptions(operatingSystems: osList);
+                api.UpdateDownloadOptions(operatingSystems: osList);
             }
         }
 
@@ -1100,7 +948,7 @@ public sealed class SocketCommandInterface : IDisposable
             cachedDepots = JsonSerializer.Deserialize(cachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
         }
 
-        var status = await _api!.GetSelectedAppsStatusAsync(cachedDepots, cancellationToken);
+        var status = await api.GetSelectedAppsStatusAsync(cachedDepots, cancellationToken);
 
         return new CommandResponse
         {
@@ -1114,7 +962,7 @@ public sealed class SocketCommandInterface : IDisposable
 
     private async Task<CommandResponse> HandleCheckCacheStatusAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        EnsureLoggedIn();
+        var api = EnsureLoggedIn();
 
         var cachedDepotsJson = request.Parameters?.GetValueOrDefault("cachedDepots");
         if (string.IsNullOrEmpty(cachedDepotsJson))
@@ -1142,7 +990,7 @@ public sealed class SocketCommandInterface : IDisposable
             };
         }
 
-        var status = await _api!.CheckCacheStatusAsync(cachedDepots, cancellationToken);
+        var status = await api.CheckCacheStatusAsync(cachedDepots, cancellationToken);
 
         return new CommandResponse
         {
@@ -1154,74 +1002,32 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private async Task<CommandResponse> HandleShutdownAsync(
-        CommandRequest request,
-        CancellationToken cancellationToken)
+    private async Task<CommandResponse> HandleShutdownAsync(CommandRequest request, CancellationToken cancellationToken)
     {
-        if (_prefillOperation.IsRunning)
+        await EndSessionAsync(false);
+        return new CommandResponse { Id = request.Id, Success = true, Message = "Shutdown complete", CompletedAt = DateTime.UtcNow };
+    }
+
+    private SteamPrefillApi EnsureLoggedIn()
+    {
+        lock (_lifecycle)
         {
-            await _prefillOperation.CancelAndWaitAsync(cancellationToken);
+            if (_api?.IsInitialized != true) throw new SteamConnectionException(SteamFailure.AuthLost);
+            return _api;
         }
-
-        CleanupApiInstance();
-
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = true,
-            Message = "Shutdown complete",
-            CompletedAt = DateTime.UtcNow
-        };
     }
 
-    private void EnsureLoggedIn()
-    {
-        if (!_isLoggedIn || _api == null || !_api.IsInitialized)
-            throw new InvalidOperationException("Not logged in. Please login first.");
-    }
-
-    private void CleanupApiInstance()
-    {
-        try
-        {
-            _api?.Shutdown();
-            _api?.Dispose();
-        }
-        catch { /* ignore cleanup errors */ }
-        _api = null;
-        _isLoggedIn = false;
-        _isLoggingIn = false;
-    }
-
-    /// <summary>
-    /// Tears down an api instance that lost the generation race (superseded by a logout) without
-    /// touching any of the shared fields, since a newer login/logout cycle may already own them.
-    /// Also erases the account store because
-    /// <see cref="Handlers.Steam.Steam3Session.GetAccessTokenAsync"/> calls <c>_userAccountStore.Save()</c>
-    /// as soon as the auth poll returns, BEFORE this generation check runs, so an orphaned login that
-    /// raced past a logout can still persist a fresh token to disk. Erasing here closes that
-    /// resurrection window; the erase is idempotent (both files may already be gone from the logout
-    /// that superseded this task).
-    /// </summary>
     private static void DisposeOrphanedApi(SteamPrefillApi api)
     {
         try
         {
-            api.Shutdown();
             api.Dispose();
         }
-        catch { /* ignore cleanup errors for a discarded orphan */ }
+        catch (Exception ex) { FileLogger.LogException("Steam session cleanup failed", ex); }
 
-        EraseAccountStore();
     }
 
-    /// <summary>
-    /// Deletes the persisted account file and its storage.key. Shared by <see cref="HandleLogoutAsync"/>
-    /// (explicit logout) and <see cref="DisposeOrphanedApi"/> (superseded-login resurrection guard).
-    /// Best-effort: both files may already be absent.
-    /// TokenStorageEncryption self-heals a missing key by regenerating it and forcing a fresh login,
-    /// so removing the key here is safe.
-    /// </summary>
+    /// <summary>Removes credentials only for an accepted explicit logout.</summary>
     private static void EraseAccountStore(IPrefillProgress? progress = null)
     {
         TryDeleteAccountStoreFile(AppConfig.AccountSettingsStorePath, "Account credentials", progress);
@@ -1240,8 +1046,21 @@ public sealed class SocketCommandInterface : IDisposable
         }
         catch (Exception ex)
         {
-            progress?.OnLog(LogLevel.Warning, $"Could not remove {label.ToLowerInvariant()} from disk: {ex.Message}");
+            FileLogger.LogException($"Could not remove {label.ToLowerInvariant()} from disk", ex);
         }
+    }
+
+    private async Task PublishStatusAsync(Task previous, string status, string message)
+    {
+        var generation = _loginGeneration;
+        await Task.Yield();
+        try { await previous; }
+        catch (Exception ex) { FileLogger.LogException("Auth state publication failed", ex); }
+        lock (_lifecycle)
+        {
+            if (generation != _loginGeneration || (status == "logged-in") != _isLoggedIn) return;
+        }
+        await BroadcastStatusAsync(status, message);
     }
 
     private async Task BroadcastStatusAsync(string status, string message)
@@ -1252,17 +1071,20 @@ public sealed class SocketCommandInterface : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
+        lock (_lifecycle)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
 
         _cts.Cancel();
+        EndSessionAsync(false).GetAwaiter().GetResult();
         _loginCts?.Dispose();
         _prefillOperation.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _cts.Dispose();
         _api?.Dispose();
         _authProvider.Dispose();
         _socketServer.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        _disposed = true;
 
         GC.SuppressFinalize(this);
     }
@@ -1274,6 +1096,15 @@ public sealed class SocketCommandInterface : IDisposable
     {
         private readonly Action<PrefillProgressUpdate>? _progressObserver;
         private readonly DaemonLogSink _logSink;
+        private readonly object _sync;
+        private readonly string? _operationId;
+        private readonly Func<bool>? _isCurrent;
+        private Task _outbound = Task.CompletedTask;
+        private PrefillSummary? _summary;
+        internal string? OperationId => _operationId;
+        internal OwnedOperationResult? Terminal { get; private set; }
+        private bool _published;
+        internal TaskCompletionSource Publication { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public SocketServer? SocketServer { get; set; }
         private DateTime _lastProgressBroadcast = DateTime.MinValue;
         private static readonly TimeSpan BroadcastThrottle = TimeSpan.FromMilliseconds(250);
@@ -1281,9 +1112,13 @@ public sealed class SocketCommandInterface : IDisposable
         internal SocketProgress(
             Action<PrefillProgressUpdate>? progressObserver = null,
             bool enableDebugLogs = false,
-            Action<string>? logWriter = null)
+            Action<string>? logWriter = null,
+            string? operationId = null, object? sync = null, Func<bool>? isCurrent = null)
         {
             _progressObserver = progressObserver;
+            _sync = sync ?? new object();
+            _operationId = operationId;
+            _isCurrent = isCurrent;
             _logSink = new DaemonLogSink(
                 logWriter ?? Console.WriteLine,
                 enableDebugLogs ? DaemonLogLevel.Debug : DaemonLogLevel.Info);
@@ -1318,45 +1153,53 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnAppStarted(AppDownloadInfo app)
         {
-            OnLog(LogLevel.Info, $"Downloading: {app.Name} ({app.AppId})");
-            BroadcastProgress(new PrefillProgressUpdate
+            lock (_sync)
             {
-                State = "downloading",
-                CurrentAppId = app.AppId,
-                CurrentAppName = app.Name,
-                TotalBytes = app.TotalBytes,
-                BytesDownloaded = 0,
-                PercentComplete = 0,
-                UpdatedAt = DateTime.UtcNow
-            });
+                if (Terminal != null || _isCurrent?.Invoke() == false) return;
+                OnLog(LogLevel.Info, $"Downloading: {app.Name} ({app.AppId})");
+                BroadcastProgress(new PrefillProgressUpdate
+                {
+                    State = "downloading",
+                    CurrentAppId = app.AppId,
+                    CurrentAppName = app.Name,
+                    TotalBytes = app.TotalBytes,
+                    BytesDownloaded = 0,
+                    PercentComplete = 0,
+                    UpdatedAt = DateTime.UtcNow
+                });
+            }
         }
 
         public void OnDownloadProgress(DownloadProgressInfo progress)
         {
-            var now = DateTime.UtcNow;
-            if (now - _lastProgressBroadcast < BroadcastThrottle)
-                return;
-
-            _lastProgressBroadcast = now;
-
-            // Log progress to console
-            var downloadedStr = FormatBytes(progress.BytesDownloaded);
-            var totalStr = FormatBytes(progress.TotalBytes);
-            var speedStr = FormatBytes((long)progress.BytesPerSecond) + "/s";
-            OnLog(LogLevel.Info, $"{progress.AppName}: {progress.PercentComplete:F1}% - {speedStr} - {downloadedStr} / {totalStr}");
-
-            BroadcastProgress(new PrefillProgressUpdate
+            lock (_sync)
             {
-                State = "downloading",
-                CurrentAppId = progress.AppId,
-                CurrentAppName = progress.AppName,
-                TotalBytes = progress.TotalBytes,
-                BytesDownloaded = progress.BytesDownloaded,
-                PercentComplete = progress.PercentComplete,
-                BytesPerSecond = progress.BytesPerSecond,
-                Elapsed = progress.Elapsed,
-                UpdatedAt = DateTime.UtcNow
-            });
+                if (Terminal != null || _isCurrent?.Invoke() == false) return;
+                var now = DateTime.UtcNow;
+                if (now - _lastProgressBroadcast < BroadcastThrottle)
+                    return;
+
+                _lastProgressBroadcast = now;
+
+                // Log progress to console
+                var downloadedStr = FormatBytes(progress.BytesDownloaded);
+                var totalStr = FormatBytes(progress.TotalBytes);
+                var speedStr = FormatBytes((long)progress.BytesPerSecond) + "/s";
+                OnLog(LogLevel.Info, $"{progress.AppName}: {progress.PercentComplete:F1}% - {speedStr} - {downloadedStr} / {totalStr}");
+
+                BroadcastProgress(new PrefillProgressUpdate
+                {
+                    State = "downloading",
+                    CurrentAppId = progress.AppId,
+                    CurrentAppName = progress.AppName,
+                    TotalBytes = progress.TotalBytes,
+                    BytesDownloaded = progress.BytesDownloaded,
+                    PercentComplete = progress.PercentComplete,
+                    BytesPerSecond = progress.BytesPerSecond,
+                    Elapsed = progress.Elapsed,
+                    UpdatedAt = DateTime.UtcNow
+                });
+            }
         }
 
         private static string FormatBytes(long bytes)
@@ -1374,75 +1217,111 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnAppCompleted(AppDownloadInfo app, AppDownloadResult result)
         {
-            OnLog(LogLevel.Info, $"Completed: {app.Name} - {result}");
-            var bytesDownloaded = result == AppDownloadResult.Success ? app.TotalBytes : 0;
-
-            // Use distinct state for cached apps so frontend can show blue animation
-            var state = result == AppDownloadResult.AlreadyUpToDate ? "already_cached" : "app_completed";
-
-            BroadcastProgress(new PrefillProgressUpdate
+            lock (_sync)
             {
-                State = state,
-                CurrentAppId = app.AppId,
-                CurrentAppName = app.Name,
-                TotalBytes = app.TotalBytes,
-                BytesDownloaded = bytesDownloaded,
-                Result = result.ToString(),
-                Depots = app.Depots?.Select(d => new DepotManifestUpdateInfo
+                if (Terminal != null || _isCurrent?.Invoke() == false) return;
+                OnLog(LogLevel.Info, $"Completed: {app.Name} - {result}");
+                var bytesDownloaded = result == AppDownloadResult.Success ? app.TotalBytes : 0;
+
+                // Use distinct state for cached apps so frontend can show blue animation
+                var state = result == AppDownloadResult.AlreadyUpToDate ? "already_cached" : "app_completed";
+
+                BroadcastProgress(new PrefillProgressUpdate
                 {
-                    DepotId = d.DepotId,
-                    ManifestId = d.ManifestId,
-                    TotalBytes = d.TotalBytes
-                }).ToList(),
-                UpdatedAt = DateTime.UtcNow
-            });
+                    State = state,
+                    CurrentAppId = app.AppId,
+                    CurrentAppName = app.Name,
+                    TotalBytes = app.TotalBytes,
+                    BytesDownloaded = bytesDownloaded,
+                    Result = result.ToString(),
+                    Depots = app.Depots?.Select(d => new DepotManifestUpdateInfo
+                    {
+                        DepotId = d.DepotId,
+                        ManifestId = d.ManifestId,
+                        TotalBytes = d.TotalBytes
+                    }).ToList(),
+                    UpdatedAt = DateTime.UtcNow
+                });
+            }
         }
 
         public void OnPrefillCompleted(PrefillSummary summary)
         {
-            OnLog(LogLevel.Info, $"Prefill complete: {summary.UpdatedApps} updated, {summary.AlreadyUpToDate} up-to-date, {summary.FailedApps} failed");
-            BroadcastProgress(new PrefillProgressUpdate
+            lock (_sync)
             {
-                State = "completed",
-                TotalApps = summary.TotalApps,
-                UpdatedApps = summary.UpdatedApps,
-                AlreadyUpToDate = summary.AlreadyUpToDate,
-                FailedApps = summary.FailedApps,
-                TotalBytesTransferred = summary.TotalBytesTransferred,
-                TotalTime = summary.TotalTime,
-                UpdatedAt = DateTime.UtcNow
-            });
+                if (Terminal != null || _isCurrent?.Invoke() == false || (_operationId == null && _progressObserver == null)) return;
+                _summary = summary;
+            }
         }
 
         public void OnError(string message, Exception? exception = null)
         {
-            OnLog(LogLevel.Error, message);
-            BroadcastProgress(new PrefillProgressUpdate
+            if (exception != null) FileLogger.LogException(message, exception);
+            else OnLog(LogLevel.Error, message);
+            lock (_sync)
             {
-                State = "error",
-                ErrorMessage = message,
-                UpdatedAt = DateTime.UtcNow
-            });
+                if (_operationId != null && _isCurrent?.Invoke() != false)
+                    SelectTerminal(OwnedOperationStatus.Failed, exception ??
+                        new SteamConnectionException("The prefill daemon could not complete the request. Try again."));
+            }
         }
 
-        internal void OnCancelled(string message)
+        internal void OnCancelled(string message) => SelectTerminal(OwnedOperationStatus.Cancelled);
+
+        internal void SelectTerminal(OwnedOperationStatus status, Exception? exception = null)
         {
-            OnLog(LogLevel.Info, message);
-            BroadcastProgress(new PrefillProgressUpdate
+            lock (_sync)
             {
-                State = "cancelled",
-                Message = message,
-                UpdatedAt = DateTime.UtcNow
-            });
+                Terminal ??= new OwnedOperationResult(status, exception);
+            }
+        }
+
+        internal Task PublishTerminalAsync(OwnedOperationResult result)
+        {
+            lock (_sync)
+            {
+                if (_published) return _outbound;
+                _published = true;
+                SelectTerminal(result.Status, result.Exception);
+                var terminal = Terminal!;
+                var failure = terminal.Exception as SteamConnectionException;
+                var update = new PrefillProgressUpdate
+                {
+                    OperationId = _operationId,
+                    State = terminal.Status == OwnedOperationStatus.Completed ? "completed" :
+                        terminal.Status == OwnedOperationStatus.Cancelled ? "cancelled" : "error",
+                    ErrorMessage = terminal.Status != OwnedOperationStatus.Failed ? null :
+                        failure?.Failure != null ? failure.Message : "The prefill daemon could not complete the request. Try again.",
+                    ErrorCode = failure?.Failure != null ? failure.ErrorCode : null,
+                    RequiresLogin = failure?.Failure != null ? failure.Failure == SteamFailure.AuthLost : null,
+                    TotalApps = _summary?.TotalApps ?? 0,
+                    UpdatedApps = _summary?.UpdatedApps ?? 0,
+                    AlreadyUpToDate = _summary?.AlreadyUpToDate ?? 0,
+                    FailedApps = _summary?.FailedApps ?? 0,
+                    TotalBytesTransferred = _summary?.TotalBytesTransferred ?? 0,
+                    TotalTime = _summary?.TotalTime ?? TimeSpan.Zero,
+                    UpdatedAt = DateTime.UtcNow
+                };
+                _outbound = SendAsync(_outbound, update);
+                return _outbound;
+            }
         }
 
         private void BroadcastProgress(PrefillProgressUpdate update)
         {
-            _progressObserver?.Invoke(update);
-            if (SocketServer == null) return;
+            if (Terminal != null || _isCurrent?.Invoke() == false || (_operationId == null && _progressObserver == null)) return;
+            update.OperationId = _operationId;
+            _outbound = SendAsync(_outbound, update);
+        }
 
-            var progressEvent = new ProgressEvent(update);
-            _ = SocketServer.BroadcastProgressAsync(progressEvent);
+        private async Task SendAsync(Task previous, PrefillProgressUpdate update)
+        {
+            await Task.Yield();
+            try { await previous; }
+            catch (Exception ex) { FileLogger.LogException("Progress publication failed", ex); }
+            _progressObserver?.Invoke(update);
+            if (SocketServer != null)
+                await SocketServer.BroadcastProgressAsync(new ProgressEvent(update));
         }
     }
 
@@ -1455,6 +1334,7 @@ public sealed class SocketCommandInterface : IDisposable
         public required System.Security.Cryptography.ECParameters ServerPrivateKey { get; init; }
         public required byte[] ServerPublicKey { get; init; }
         public required DateTime ExpiresAt { get; init; }
+        public required long Generation { get; init; }
     }
 
 }

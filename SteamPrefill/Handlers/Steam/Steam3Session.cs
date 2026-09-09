@@ -1,6 +1,8 @@
 using SteamKit2.Authentication;
 using SteamPrefill.Api;
 
+#nullable enable annotations
+
 namespace SteamPrefill.Handlers.Steam
 {
     public sealed class Steam3Session : IDisposable
@@ -61,10 +63,64 @@ namespace SteamPrefill.Handlers.Steam
 
         #endregion
 
-        public Steam3Session(IAnsiConsole ansiConsole, ISteamAuthProvider? authProvider = null)
+        private readonly CancellationTokenSource _pumpCts = new();
+        private readonly Task _pump;
+        private readonly object _sessionLock = new();
+        private TaskCompletionSource<bool> _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<SteamUser.LoggedOnCallback> _loggedOn = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _licenses = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly CancellationTokenSource _authLost = new();
+        private readonly CancellationToken _authLostToken;
+        private bool _isAuthenticated;
+        private bool _logonRequested;
+        private bool _disposed;
+        public bool IsAuthenticated { get { lock (_sessionLock) return _isAuthenticated; } }
+        public CancellationToken AuthLostToken => _authLostToken;
+        internal string Username => _userAccountStore.CurrentUsername;
+        internal DateTime? AuthExpiryUtc => _userAccountStore.GetAccessTokenExpiryUtc();
+        internal uint? LoginId => _userAccountStore.SessionId;
+        internal EResult? LogoffResult { get; private set; }
+        public event Action<EResult?> AuthenticationLost;
+
+        internal void WhileAuthenticated(Action action, CancellationToken cancellationToken)
         {
-            _ansiConsole = ansiConsole;
+            lock (_sessionLock)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!_isAuthenticated) throw new SteamConnectionException(SteamFailure.AuthLost);
+                action();
+            }
+        }
+
+        private void InvalidateAuthentication(EResult? result)
+        {
+            bool notify;
+            lock (_sessionLock)
+            {
+                notify = _isAuthenticated;
+                _isAuthenticated = false;
+                if (notify) LogoffResult = result;
+            }
+            if (notify) AuthenticationLost?.Invoke(result);
+            if (!_disposed && (notify || _logonRequested)) _authLost.Cancel();
+        }
+
+        public Steam3Session(IAnsiConsole? ansiConsole, ISteamAuthProvider? authProvider = null, Action<Action>? commitCredentials = null)
+        {
+            _authLostToken = _authLost.Token;
+            _ansiConsole = ansiConsole ?? AnsiConsole.Console;
             _authProvider = authProvider;
+
+            try
+            {
+                _userAccountStore = UserAccountStore.LoadFromFile(commitCredentials);
+            }
+            catch
+            {
+                _pumpCts.Dispose();
+                _authLost.Dispose();
+                throw;
+            }
 
             _steamClient = new SteamClient(SteamConfiguration.Create(e => e.WithCellID(CellId)
                                                                .WithConnectionTimeout(TimeSpan.FromSeconds(10))));
@@ -81,28 +137,44 @@ namespace SteamPrefill.Handlers.Steam
             {
                 _isConnecting = false;
                 _disconnected = false;
+                _connected.TrySetResult(true);
             });
             // If a connection attempt fails in any way, SteamKit2 notifies of the failure with a "disconnect"
             _callbackManager.Subscribe<SteamClient.DisconnectedCallback>(e =>
             {
                 _isConnecting = false;
                 _disconnected = true;
+                _connected.TrySetResult(false);
+                InvalidateAuthentication(null);
+                _loggedOn.TrySetException(new SteamConnectionException(SteamFailure.AuthLost));
             });
 
             _callbackManager.Subscribe<SteamUser.LoggedOnCallback>(loggedOn =>
             {
                 _loggedOnCallbackResult = loggedOn;
+                lock (_sessionLock)
+                {
+                    if (!_disposed && !_authLost.IsCancellationRequested)
+                        _isAuthenticated = loggedOn.Result == EResult.OK;
+                }
                 CellId = loggedOn.CellID;
+                _loggedOn.TrySetResult(loggedOn);
             });
+            _callbackManager.Subscribe<SteamUser.LoggedOffCallback>(loggedOff => InvalidateAuthentication(loggedOff.Result));
             _callbackManager.Subscribe<LicenseListCallback>(LicenseListCallback);
 
             CdnClient = new Client(_steamClient);
             // Configuring SteamKit's HttpClient to timeout in a more reasonable time frame.  This is only used when downloading manifests
             Client.RequestTimeout = TimeSpan.FromSeconds(60);
 
-            _userAccountStore = UserAccountStore.LoadFromFile();
             _userAccountStore.AuthProvider = authProvider; // Set auth provider for API/daemon mode
+            _userAccountStore.CommitCredentials = commitCredentials;
             LicenseManager = new LicenseManager(SteamAppsApi);
+            _pump = Task.Factory.StartNew(() =>
+            {
+                while (!_pumpCts.IsCancellationRequested)
+                    _callbackManager.RunWaitAllCallbacks(TimeSpan.FromMilliseconds(50));
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
             // Setting up optional SteamKit2 debug output.  Not enabled by default because it writes out way too much output that isn't useful outside of debugging.
             if (AppConfig.DebugLogs)
@@ -114,6 +186,7 @@ namespace SteamPrefill.Handlers.Steam
 
         public async Task LoginToSteamAsync(CancellationToken cancellationToken = default)
         {
+            using var cancellation = cancellationToken.Register(() => InvalidateAuthentication(null));
             await ConfigureLoginDetailsAsync(cancellationToken);
 
             int retryCount = 0;
@@ -122,19 +195,17 @@ namespace SteamPrefill.Handlers.Steam
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
-
                 SteamUser.LoggedOnCallback logonResult = null;
                 await _ansiConsole.StatusSpinner().StartAsync("Connecting to Steam...", async ctx =>
                 {
-                    ConnectToSteam(cancellationToken);
+                    await ConnectToSteam(cancellationToken);
 
                     // Making sure that we have a valid access token before moving onto the login
                     ctx.Status = "Retrieving access token...";
                     await GetAccessTokenAsync(cancellationToken);
 
                     ctx.Status = "Logging in to Steam...";
-                    logonResult = AttemptSteamLogin(cancellationToken);
+                    logonResult = await AttemptSteamLogin(cancellationToken);
                 });
 
                 logonSuccess = HandleLogonResult(logonResult);
@@ -170,14 +241,14 @@ namespace SteamPrefill.Handlers.Steam
                 Password = _logonDetails.Password,
                 IsPersistentSession = true,
                 Authenticator = authenticator
-            });
+            }).WaitAsync(cancellationToken);
 
             // Starting polling Steam for authentication response
             // Pass cancellation token so we can abort if cancel-login is called
             // Also add a 3-minute timeout as a safety measure for device confirmation
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-            
+
             try
             {
                 var pollResponse = await authSession.PollingWaitForResultAsync(linkedCts.Token);
@@ -202,13 +273,13 @@ namespace SteamPrefill.Handlers.Steam
         private async Task ConfigureLoginDetailsAsync(CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var username = await _userAccountStore.GetUsernameAsync(_ansiConsole);
+            var username = await _userAccountStore.GetUsernameAsync(_ansiConsole).WaitAsync(cancellationToken);
 
             _logonDetails = new SteamUser.LogOnDetails
             {
                 Username = username,
                 ShouldRememberPassword = true,
-                Password = _userAccountStore.AccessTokenIsValid() ? null : await _userAccountStore.GetPasswordAsync(_ansiConsole),
+                Password = _userAccountStore.AccessTokenIsValid() ? null : await _userAccountStore.GetPasswordAsync(_ansiConsole).WaitAsync(cancellationToken),
                 LoginID = _userAccountStore.SessionId
             };
             _ansiConsole.LogMarkupLine($"Session LoginID set to: {_userAccountStore.SessionId} (0x{_userAccountStore.SessionId:X8})");
@@ -224,7 +295,8 @@ namespace SteamPrefill.Handlers.Steam
         /// Retries if necessary until successful connection is established
         /// </summary>
         /// <exception cref="SteamConnectionException">Throws if unable to connect to Steam</exception>
-        private void ConnectToSteam(CancellationToken cancellationToken = default)
+        [SuppressMessage("Naming", "VSTHRD200", Justification = "Retains the established method name.")]
+        private async Task ConnectToSteam(CancellationToken cancellationToken = default)
         {
             _ansiConsole.LogMarkupVerbose($"Connecting with CellId: {Magenta(CellId)}");
             var timeoutAfter = DateTime.Now.AddSeconds(30);
@@ -235,6 +307,7 @@ namespace SteamPrefill.Handlers.Steam
                 cancellationToken.ThrowIfCancellationRequested();
 
                 _isConnecting = true;
+                _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 _steamClient.Connect();
 
                 // Busy waiting until SteamKit2 either succeeds/fails the connection attempt
@@ -242,7 +315,7 @@ namespace SteamPrefill.Handlers.Steam
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
+                    await _connected.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
                     if (DateTime.Now > timeoutAfter)
                     {
                         throw new SteamConnectionException("Timeout connecting to Steam...  Try again in a few moments");
@@ -260,11 +333,14 @@ namespace SteamPrefill.Handlers.Steam
         private int _failedLogonAttempts;
 
         [SuppressMessage("Maintainability", "CA1508:Avoid dead conditional code", Justification = "while() loop is not infinite.  _loggedOnCallbackResult is set after logging into Steam")]
-        private SteamUser.LoggedOnCallback AttemptSteamLogin(CancellationToken cancellationToken = default)
+        [SuppressMessage("Naming", "VSTHRD200", Justification = "Retains the established method name.")]
+        private async Task<SteamUser.LoggedOnCallback> AttemptSteamLogin(CancellationToken cancellationToken = default)
         {
             var timeoutAfter = DateTime.Now.AddSeconds(30);
             // Need to reset this global result value, as it will be populated once the logon callback completes
             _loggedOnCallbackResult = null;
+            _loggedOn = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _logonRequested = true;
 
             _logonDetails.AccessToken = _userAccountStore.AccessToken;
             _ansiConsole.LogMarkupLine($"Logging in with LoginID: {_logonDetails.LoginID} (0x{_logonDetails.LoginID:X8})");
@@ -275,7 +351,7 @@ namespace SteamPrefill.Handlers.Steam
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
+                await _loggedOn.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
                 if (DateTime.Now > timeoutAfter)
                 {
                     throw new SteamLoginException("Timeout logging into Steam...  Try again in a few moments");
@@ -364,58 +440,53 @@ namespace SteamPrefill.Handlers.Steam
 
         public void Disconnect()
         {
-            if (_disconnected)
-            {
-                // Needed so message doesn't display on the same line as the prompt
-                _ansiConsole.WriteLine("");
-                _ansiConsole.LogMarkupLine("Already disconnected from Steam");
-                return;
-            }
-
-            _disconnected = false;
+            if (_disposed) return;
+            InvalidateAuthentication(null);
+            _authLost.Cancel();
+            _pumpCts.Cancel();
             _steamClient.Disconnect();
-
-            _ansiConsole.StatusSpinner().Start("Disconnecting", context =>
-            {
-                while (!_disconnected)
-                {
-                    _callbackManager.RunWaitAllCallbacks(TimeSpan.FromMilliseconds(100));
-                }
-            });
-            _ansiConsole.LogMarkupLine("Disconnected from Steam!");
+            if (Task.CurrentId != _pump.Id) _pump.GetAwaiter().GetResult();
+            _disconnected = true;
+            _isConnecting = false;
+            _connected.TrySetCanceled();
+            _loggedOn.TrySetCanceled();
         }
 
         #endregion
 
         #region LoadAccountLicenses
 
-        private bool _loadAccountLicensesIsRunning = true;
         /// <summary>
         /// Waits for the user's currently owned licenses(games) to be returned.
         /// The license query is triggered on application startup, and requires busy-waiting to receive the callback
         /// </summary>
-        public void WaitForLicenseCallback()
+        [SuppressMessage("Naming", "VSTHRD200", Justification = "Retains the established method name.")]
+        public async Task WaitForLicenseCallback(CancellationToken cancellationToken = default)
         {
-            _ansiConsole.StatusSpinner().Start("Retrieving owned apps...", _ =>
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _authLost.Token);
+            try
             {
-                while (_loadAccountLicensesIsRunning)
-                {
-                    _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
-                }
-            });
+                await _licenses.Task.WaitAsync(TimeSpan.FromSeconds(45), linked.Token);
+            }
+            catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new SteamConnectionException(SteamFailure.AuthLost, ex);
+            }
+            if (!IsAuthenticated) throw new SteamConnectionException(SteamFailure.AuthLost);
         }
 
         private void LicenseListCallback(LicenseListCallback licenseList)
         {
             var timer = Stopwatch.StartNew();
 
-            _loadAccountLicensesIsRunning = false;
             if (licenseList.Result != EResult.OK)
             {
                 _ansiConsole.MarkupLine(Red($"Unexpected error while retrieving license list : {licenseList.Result}"));
-                throw new SteamLoginException("Unable to retrieve user licenses!");
+                _licenses.TrySetException(new SteamLoginException("Unable to retrieve user licenses!"));
+                return;
             }
             LicenseManager.LoadPackageInfo(licenseList.LicenseList);
+            _licenses.TrySetResult(true);
 
             _ansiConsole.LogMarkupLine("Loaded account licenses", timer);
         }
@@ -424,6 +495,16 @@ namespace SteamPrefill.Handlers.Steam
 
         public void Dispose()
         {
+            Disconnect();
+            lock (_sessionLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+            }
+            _pumpCts.Cancel();
+            if (Task.CurrentId != _pump.Id) _pump.GetAwaiter().GetResult();
+            _pumpCts.Dispose();
+            _authLost.Dispose();
             CdnClient.Dispose();
         }
     }
